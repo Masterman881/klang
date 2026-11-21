@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0b0b0f">
+  <meta name="description" content="Klang – dein eigener Musikplayer. Offline, werbefrei, kostenlos.">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Klang">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="icons/icon-192.png">
+  <title>Klang</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <div id="app">
+    <aside id="sidebar">
+      <a class="brand" href="#/"><img src="icons/icon.svg" alt=""><span>Klang</span></a>
+      <nav class="side-nav">
+        <a href="#/" data-nav="home"><i data-icon="home"></i>Start</a>
+        <a href="#/search" data-nav="search"><i data-icon="search"></i>Suchen</a>
+      </nav>
+      <div class="side-label">Bibliothek</div>
+      <nav class="side-nav">
+        <a href="#/songs" data-nav="songs"><i data-icon="music"></i>Titel</a>
+        <a href="#/albums" data-nav="albums"><i data-icon="disc"></i>Alben</a>
+        <a href="#/artists" data-nav="artists"><i data-icon="user"></i>Künstler</a>
+        <a href="#/favorites" data-nav="favorites"><i data-icon="heart"></i>Favoriten</a>
+      </nav>
+      <div class="side-label side-label-row">
+        <a href="#/playlists" data-nav="playlists">Playlists</a>
+        <button class="icon-btn sm" data-action="new-playlist" title="Neue Playlist"><i data-icon="plus"></i></button>
+      </div>
+      <div id="side-playlists" class="side-nav side-scroll"></div>
+      <div class="side-bottom">
+        <button class="btn btn-accent wide" data-action="import-files"><i data-icon="upload"></i>Musik hinzufügen</button>
+        <button class="btn wide hidden" data-action="install" data-install><i data-icon="download"></i>App installieren</button>
+        <nav class="side-nav">
+          <a href="#/settings" data-nav="settings"><i data-icon="settings"></i>Einstellungen</a>
+        </nav>
+      </div>
+    </aside>
+
+    <main id="main"><div id="view"></div></main>
+
+    <footer id="player" class="hidden">
+      <div class="mini-progress"><div data-np="bar"></div></div>
+      <div class="pb-left">
+        <button class="pb-art" data-action="open-np" aria-label="Wiedergabe öffnen"><div class="cover" data-np="cover"></div></button>
+        <div class="pb-meta" data-action="open-np-mobile">
+          <div class="pb-title" data-np="title"></div>
+          <a class="pb-artist" data-np="artist-link" data-action="goto-artist" href="#"></a>
+        </div>
+        <button class="icon-btn pb-fav" data-action="fav-current" data-np="fav" aria-label="Favorit"><i data-icon="heart"></i></button>
+      </div>
+      <div class="pb-center">
+        <div class="pb-controls">
+          <button class="icon-btn d-only" data-action="shuffle" data-np="shuffle" title="Zufallswiedergabe (S)"><i data-icon="shuffle"></i></button>
+          <button class="icon-btn d-only" data-action="prev" title="Zurück"><i data-icon="prev"></i></button>
+          <button class="play-btn" data-action="toggle" data-np="play" title="Abspielen / Pause (Leertaste)"><i data-icon="play"></i></button>
+          <button class="icon-btn" data-action="next" title="Weiter"><i data-icon="next"></i></button>
+          <button class="icon-btn d-only" data-action="repeat" data-np="repeat" title="Wiederholen (R)"><i data-icon="repeat"></i></button>
+        </div>
+        <div class="pb-seek d-only">
+          <span class="time" data-np="cur">0:00</span>
+          <input type="range" class="range" min="0" max="1000" value="0" step="1" data-seek aria-label="Position">
+          <span class="time" data-np="dur">0:00</span>
+        </div>
+      </div>
+      <div class="pb-right d-only">
+        <button class="icon-btn" data-action="sleep" data-np="sleep" title="Sleep-Timer"><i data-icon="moon"></i></button>
+        <button class="icon-btn" data-action="queue" data-np="queue-btn" title="Warteschlange (Q)"><i data-icon="queue"></i></button>
+        <button class="icon-btn" data-action="mute" data-np="vol-icon" title="Stumm (M)"><i data-icon="volume"></i></button>
+        <input type="range" class="range vol" min="0" max="100" value="100" data-vol aria-label="Lautstärke">
+        <button class="icon-btn" data-action="open-np" title="Vollbild"><i data-icon="expand"></i></button>
+      </div>
+    </footer>
+
+    <nav id="bottomnav">
+      <a href="#/" data-nav="home"><i data-icon="home"></i><span>Start</span></a>
+      <a href="#/search" data-nav="search"><i data-icon="search"></i><span>Suchen</span></a>
+      <a href="#/songs" data-nav="library"><i data-icon="library"></i><span>Bibliothek</span></a>
+      <a href="#/playlists" data-nav="playlists"><i data-icon="playlist"></i><span>Playlists</span></a>
+    </nav>
+  </div>
+
+  <!-- Vollbild-Wiedergabe -->
+  <section id="np" aria-label="Aktuelle Wiedergabe">
+    <div class="np-inner">
+      <header class="np-head">
+        <button class="icon-btn lg" data-action="close-np" aria-label="Schließen"><i data-icon="chevron-down"></i></button>
+        <div class="np-src"><small>Wiedergabe aus</small><span data-np="source">Bibliothek</span></div>
+        <button class="icon-btn lg" data-action="np-menu" aria-label="Mehr"><i data-icon="more"></i></button>
+      </header>
+      <div class="np-art"><div class="cover" data-np="cover"></div></div>
+      <div class="np-meta">
+        <div class="np-text">
+          <div class="np-title" data-np="title"></div>
+          <a class="np-artist" data-np="artist-link" data-action="goto-artist" href="#"></a>
+        </div>
+        <button class="icon-btn lg" data-action="fav-current" data-np="fav" aria-label="Favorit"><i data-icon="heart"></i></button>
+      </div>
+      <div class="np-seek">
+        <input type="range" class="range" min="0" max="1000" value="0" step="1" data-seek aria-label="Position">
+        <div class="np-times"><span data-np="cur">0:00</span><span data-np="dur">0:00</span></div>
+      </div>
+      <div class="np-controls">
+        <button class="icon-btn lg" data-action="shuffle" data-np="shuffle" aria-label="Zufallswiedergabe"><i data-icon="shuffle"></i></button>
+        <button class="icon-btn xl" data-action="prev" aria-label="Zurück"><i data-icon="prev"></i></button>
+        <button class="play-btn xl" data-action="toggle" data-np="play" aria-label="Abspielen / Pause"><i data-icon="play"></i></button>
+        <button class="icon-btn xl" data-action="next" aria-label="Weiter"><i data-icon="next"></i></button>
+        <button class="icon-btn lg" data-action="repeat" data-np="repeat" aria-label="Wiederholen"><i data-icon="repeat"></i></button>
+      </div>
+      <div class="np-extra">
+        <button class="pill-btn" data-action="sleep" data-np="sleep"><i data-icon="moon"></i><span data-np="sleep-label">Sleep-Timer</span></button>
+        <button class="pill-btn" data-action="queue"><i data-icon="queue"></i><span>Warteschlange</span></button>
+      </div>
+    </div>
+  </section>
+
+  <!-- Warteschlange -->
+  <div id="queue-backdrop" data-action="close-queue"></div>
+  <aside id="queue" aria-label="Warteschlange">
+    <header class="q-head">
+      <h2>Warteschlange</h2>
+      <button class="btn btn-sm" data-action="clear-queue">Leeren</button>
+      <button class="icon-btn" data-action="close-queue" aria-label="Schließen"><i data-icon="x"></i></button>
+    </header>
+    <div id="queue-list"></div>
+  </aside>
+
+  <div id="menu-layer"></div>
+  <div id="dialog-layer"></div>
+  <div id="toasts" aria-live="polite"></div>
+  <div id="drop-overlay"><div><i data-icon="upload"></i><p>Loslassen, um Musik hinzuzufügen</p></div></div>
+
+  <input type="file" id="file-input" multiple accept="audio/*,.mp3,.m4a,.flac,.ogg,.oga,.opus,.wav,.aac,.webm" hidden>
+  <input type="file" id="folder-input" webkitdirectory multiple hidden>
+  <input type="file" id="image-input" accept="image/*" hidden>
+
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>
