@@ -89,8 +89,10 @@ input, textarea { caret-color: var(--accent); }
 /* ============ Layout ============ */
 #app {
   display: grid;
-  height: 100vh;
-  height: 100dvh;
+  /* Fest an alle vier Ränder: als Startbildschirm-App auf dem iPhone sind 100vh/100dvh
+     kürzer als der Bildschirm, dann bleibt unten ein schwarzer Streifen */
+  position: fixed;
+  inset: 0;
   grid-template-columns: var(--side-w) minmax(0, 1fr);
   grid-template-rows: minmax(0, 1fr) auto;
   grid-template-areas: "side main" "player player";
