@@ -80,15 +80,17 @@ const SRV_KEY = 'klang-srv-key';
 })();
 // Privater Cloud-Speicher (Cloudflare R2 hinter dem Klang-Worker). Zugang kommt per QR-Code als #cloud=…&ck=…
 const CLOUD = 'klang-cloud';
-(() => {
-  const m = /^#cloud=([^&]+)&ck=([^&]+)/.exec(location.hash);
-  if (!m) return;
+function takeCloudLink(text) {
+  const m = /#cloud=([^&\s]+)&ck=([^&\s#]+)/.exec(String(text || ''));
+  if (!m) return false;
   try {
     const url = decodeURIComponent(m[1]).replace(/\/+$/, '');
-    if (/^https:\/\/[a-z0-9.-]+$/i.test(url)) ls.set(CLOUD, { url, key: decodeURIComponent(m[2]) });
-  } catch { /* */ }
-  history.replaceState(null, '', location.pathname + location.search + '#/');
-})();
+    if (!/^https:\/\/[a-z0-9.-]+$/i.test(url)) return false;
+    ls.set(CLOUD, { url, key: decodeURIComponent(m[2]) });
+    return true;
+  } catch { return false; }
+}
+if (/^#cloud=/.test(location.hash)) { takeCloudLink(location.hash); history.replaceState(null, '', location.pathname + location.search + '#/'); }
 const cloudCfg = () => { const c = ls.get(CLOUD, null); return c?.url && c?.key ? c : null; };
 const cloudSrc = (path) => { const c = cloudCfg(); return c ? `${c.url}${encPath(path)}?k=${encodeURIComponent(c.key)}` : ''; };
 function withKey(url) {
@@ -2157,8 +2159,19 @@ const settingsBtn = () => `${auth.current() ? `<a class="m-only profile-btn" hre
 
 function emptyLib() {
   const folder = finePointer() && 'webkitdirectory' in document.createElement('input');
-  return `<div class="empty">
-    <h2>Deine Bibliothek ist noch leer</h2>
+  const onPc = /^(localhost|127\.0\.0\.1|\[::1\])$/.test(location.hostname);
+  const cloud = !onPc && !cloudCfg() ? `<div class="empty cloud-empty">
+    <h2>Deine Songs holen</h2>
+    <p>Deine Musik liegt in deiner privaten Cloud. Diese Seite braucht einmal deinen Schlüssel, dann sind alle Songs da.</p>
+    <ol class="steps">
+      <li>Am PC <b>Klang starten</b> (Klang starten.bat).</li>
+      <li>Dort auf <b>„Aufs Handy“</b> klicken.</li>
+      <li>Handy: QR-Code scannen. PC: <b>„Link kopieren“</b> drücken und hier einfügen.</li>
+    </ol>
+    <div class="btns"><button class="btn btn-accent" data-action="cloud-link">${icon('link')}Link einfügen</button></div>
+  </div>` : '';
+  return `${cloud}<div class="empty">
+    <h2>${cloud ? 'Oder Dateien von diesem Gerät' : 'Deine Bibliothek ist noch leer'}</h2>
     <p>Lade deine MP3s, M4As, FLACs oder WAVs. Sie bleiben auf diesem Gerät und spielen auch offline. Bis dahin läuft unten schon Musik von Audius und aus dem Radio.</p>
     <div class="btns">
       <button class="btn btn-accent" data-action="import-files">${icon('upload')}Dateien auswählen</button>
@@ -2980,6 +2993,7 @@ const actions = {
   'import-folder': () => { $('#folder-input').value = ''; $('#folder-input').click(); },
   'reload-server-lib': () => loadServerLibrary(true),
   'cloud-reload': () => loadCloudLibrary(true),
+  'cloud-link': () => cloudLinkDialog(),
   'cloud-off': async () => {
     const r = await openDialog({ title: 'Cloud trennen?', body: '<p>Die Cloud-Songs verschwinden von diesem Gerät (Favoriten bleiben). Deine Songs in der Cloud bleiben erhalten, du kannst dich per QR-Code jederzeit neu verbinden.</p>', buttons: [{ label: 'Abbrechen' }, { label: 'Trennen', danger: true, value: 'ok' }] });
     if (r) { cloudDisconnect(); refresh(); }
@@ -3348,7 +3362,13 @@ function setupEvents() {
 
   window.addEventListener('pagehide', saveState);
   document.addEventListener('visibilitychange', () => { if (document.hidden) saveState(); });
-  window.addEventListener('hashchange', () => { closeMenu(); withTransition('route', () => render()); });
+  window.addEventListener('hashchange', () => {
+    if (/^#cloud=/.test(location.hash)) {
+      const ok = takeCloudLink(location.hash);
+      history.replaceState(null, '', location.pathname + location.search + '#/');
+      if (ok) loadCloudLibrary(true);
+    }
+    closeMenu(); withTransition('route', () => render()); });
 }
 
 /* =========================================================
@@ -3462,6 +3482,17 @@ async function loadServerLibrary(showToast = false) {
 }
 
 /* ---------- Cloud: alle Songs von überall (privater Speicher, nur mit Schlüssel) ---------- */
+async function cloudLinkDialog() {
+  const r = await openDialog({
+    title: 'Cloud verbinden',
+    body: `<label class="field"><span>Link von „Aufs Handy“ am PC</span><input name="link" placeholder="https://masterman881.github.io/klang/#cloud=…" autocomplete="off" spellcheck="false"></label>`,
+    buttons: [{ label: 'Abbrechen' }, { label: 'Verbinden', primary: true, value: 'ok' }],
+  });
+  if (r?.value !== 'ok') return;
+  if (!takeCloudLink(r.data.link)) { toast('Das ist nicht der richtige Link. Am PC unter „Aufs Handy“ auf „Link kopieren“ drücken.', 5000); return; }
+  await loadCloudLibrary(true);
+  render();
+}
 async function loadCloudLibrary(showToast = false) {
   const c = cloudCfg();
   if (!c) return;
@@ -3577,7 +3608,7 @@ async function phoneConnect(forceLan = false) {
       const link = `${APP_URL}#cloud=${encodeURIComponent(c.url)}&ck=${encodeURIComponent(c.key)}`;
       const qr = qrcode(0, 'M'); qr.addData(link); qr.make();
       const n = [...S.tracks.values()].filter((t) => t.remote === 'server').length;
-      const r = await openDialog({
+      const pending = openDialog({
         title: 'Aufs Handy',
         body: `<div class="qr">${qr.createSvgTag({ cellSize: 5, margin: 2, scalable: true, alt: 'QR-Code für Klang mit Cloud-Zugang' })}</div>
           <ol class="steps">
@@ -3586,9 +3617,16 @@ async function phoneConnect(forceLan = false) {
             <li>Klang zum Startbildschirm hinzufügen (iPhone: Teilen → „Zum Home-Bildschirm“).</li>
           </ol>
           <p class="small muted">Der Code enthält deinen geheimen Cloud-Schlüssel. Zeig ihn niemandem. Unterwegs braucht das Handy Internet.</p>
+          <div class="btns qr-btns"><button class="btn" type="button" data-copy-link>${icon('link')}Link kopieren</button><a class="btn" href="${esc(link)}" target="_blank" rel="noopener">${icon('external')}Hier am PC öffnen</a></div>
           <p class="small muted"><button class="link" type="button" data-value="lan">Stattdessen nur im WLAN vom PC hören</button></p>`,
         buttons: [{ label: 'Fertig', primary: true, value: 'ok' }],
       });
+      $('#dialog-layer [data-copy-link]')?.addEventListener('click', async (e) => {
+        try { await navigator.clipboard.writeText(link); toast('Link kopiert. Auf der Online-Seite „Link einfügen“ drücken.'); }
+        catch { toast('Kopieren ging nicht. Nimm „Hier am PC öffnen“.'); }
+        e.currentTarget.blur();
+      });
+      const r = await pending;
       if (r?.value === 'lan') phoneConnect(true);
       return;
     }
