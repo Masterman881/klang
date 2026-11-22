@@ -1,6 +1,6 @@
 // Service Worker: macht VERS offline-fähig und installierbar.
 // Bei Änderungen an der App die Versionsnummer erhöhen.
-const CACHE = 'vers-v21';
+const CACHE = 'vers-v22';
 const ASSETS = [
   './',
   'index.html',

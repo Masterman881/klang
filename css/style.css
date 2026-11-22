@@ -1429,3 +1429,14 @@ html { background: var(--bg); }
   .set-nav { overflow-x: auto; flex-wrap: nowrap; }
 }
 .m-home-head h1 { font-family: var(--display); font-weight: 500; text-transform: uppercase; letter-spacing: .01em; }
+
+/* Untere Leiste mit 6 Punkten: etwas kompakter */
+@media (max-width: 860px) {
+  #bottomnav a, #bottomnav button { font-size: 10px; letter-spacing: .05em; gap: 3px; }
+}
+/* Offline-Hinweis */
+#net-banner { position: fixed; left: 50%; top: calc(var(--safe-t) + 8px); transform: translateX(-50%); z-index: 90; display: flex; align-items: center; gap: 8px; max-width: calc(100vw - 32px);
+  padding: 8px 14px; border-radius: 99px; background: var(--surface3); border: 1px solid var(--line2); color: var(--text); font-size: 13px; box-shadow: var(--shadow); }
+#net-banner[hidden] { display: none; }
+#net-banner .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--live); flex-shrink: 0; }
+#net-banner span { white-space: nowrap; }

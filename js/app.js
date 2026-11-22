@@ -583,7 +583,18 @@ window.addEventListener('popstate', () => {
 // Vier Abspieler: je zwei direkt (gehen immer, auch im Hintergrund auf dem iPhone) und je zwei durch den
 // Equalizer (brauchen CORS-Freigabe der Quelle). Je zwei, damit der nächste Song vorab lädt
 // (lückenlos) und beide beim Überblenden gleichzeitig laufen können. `audio` zeigt auf den aktiven.
-const mkAudio = (cors) => { const a = new Audio(); if (cors) a.crossOrigin = 'anonymous'; a.preload = 'auto'; return a; };
+// Abspieler liegen im Dokument und erlauben AirPlay, sonst bietet iOS sie nicht für AirPlay/Bluetooth an
+const mkAudio = (cors) => {
+  const a = document.createElement('audio');
+  if (cors) a.crossOrigin = 'anonymous';
+  a.preload = 'auto';
+  a.setAttribute('x-webkit-airplay', 'allow');
+  a.setAttribute('playsinline', '');
+  a.disableRemotePlayback = false;
+  a.hidden = true;
+  document.body.appendChild(a);
+  return a;
+};
 const decks = { plain: [mkAudio(false), mkAudio(false)], eq: [mkAudio(true), mkAudio(true)] };
 const allEls = [...decks.plain, ...decks.eq];
 const isEqEl = (el) => decks.eq.includes(el);
@@ -1061,6 +1072,7 @@ function bindAudio(el) {
       loadAndPlay(wantPlay, t.live ? 0 : audio.currentTime || 0);
       return;
     }
+    if (!navigator.onLine && t?.remote && !isDl(t.id)) { netRetry = { id: t.id, pos: audio.currentTime || 0, play: wantPlay }; toast('Kein Internet. Der Song läuft weiter, sobald du wieder online bist.', 3500); return; }
     toast(t?.remote
       ? `„${t.title}“ konnte nicht geladen werden${navigator.onLine ? '' : ' (keine Internetverbindung)'}.`
       : `„${t?.title || 'Titel'}“ kann in diesem Browser nicht abgespielt werden.`, 4000);
@@ -3631,13 +3643,13 @@ function refresh() {
 function updateNav(name) {
   const map = { album: 'albums', artist: 'artists', playlist: 'playlists', oartist: 'discover' };
   const key = map[name] || name;
-  const lib = ['songs', 'albums', 'artists', 'favorites', 'album', 'artist', 'playlists', 'playlist', 'downloads'].includes(name);
+  const lib = ['songs', 'albums', 'artists', 'album', 'artist', 'playlists', 'playlist', 'downloads'].includes(name);
   $$('[data-nav]').forEach((a) => {
     const n = a.dataset.nav;
     a.classList.toggle('active', n === key || (n === 'library' && lib) || (n === 'discover-m' && ['discover', 'radio', 'oartist'].includes(name)));
   });
   const libLink = $('#bottomnav [data-nav="library"]');
-  if (libLink) libLink.href = `#/${['songs', 'albums', 'artists', 'favorites', 'playlists', 'downloads'].includes(S.lastLib) ? S.lastLib : 'songs'}`;
+  if (libLink) libLink.href = `#/${['songs', 'albums', 'artists', 'playlists', 'downloads'].includes(S.lastLib) ? S.lastLib : 'songs'}`;
   $$('#side-playlists a').forEach((a) => a.classList.toggle('active', name === 'playlist' && a.dataset.pl === parseRoute().arg));
 }
 function renderSidebarPlaylists() {
@@ -4645,7 +4657,14 @@ async function prefetchNext() {
 const canAirPlay = () => typeof audio.webkitShowPlaybackTargetPicker === 'function';
 const canSink = () => typeof HTMLMediaElement.prototype.setSinkId === 'function';
 async function pickOutput() {
-  if (canAirPlay()) { try { audio.webkitShowPlaybackTargetPicker(); } catch { /* */ } return; }
+  if (canAirPlay()) {
+    // Mit Equalizer läuft der Ton durch Web Audio, das kann iOS nicht an AirPlay/Bluetooth-Boxen schicken
+    if (eq.on && isEqEl(audio)) { setEqOn(false); toast('Equalizer ist für AirPlay ausgeschaltet. Tippe nochmal auf das Gerät-Symbol.', 4000); return; }
+    if (!curId) { toast('Starte zuerst einen Song, dann das Gerät wählen.'); return; }
+    if (deferred || audio.paused) togglePlay();
+    try { audio.webkitShowPlaybackTargetPicker(); } catch { /* */ }
+    return;
+  }
   if (navigator.mediaDevices?.selectAudioOutput) {
     try { const d = await navigator.mediaDevices.selectAudioOutput(); await setOutput(d.deviceId, d.label); } catch { /* abgebrochen */ }
     return;
@@ -4679,6 +4698,37 @@ function hideSplash() {
   setTimeout(() => sp.remove(), 600);
 }
 
+
+/* ---------- Offline erkennen und beim Zurückkommen von selbst weitermachen ---------- */
+let netRetry = null; // Song, der wegen fehlendem Netz hängen blieb
+function setNetBanner() {
+  const b = $('#net-banner');
+  if (!b) return;
+  const off = !navigator.onLine;
+  document.body.classList.toggle('is-offline', off);
+  b.hidden = !off;
+  if (off) b.innerHTML = `<i class="dot"></i><span>Offline · ${dlIds.size ? 'Downloads laufen weiter' : 'Kein Internet'}</span>`;
+}
+async function backOnline() {
+  setNetBanner();
+  toast('Wieder online', 1600);
+  apiCache.clear();
+  // Bibliothek, Cover, Songtexte und Status von selbst nachholen, ohne Neuladen
+  await loadServerLibrary(false);
+  if (!S.srvOK && cloudCfg()) await loadCloudLibrary(false);
+  $$('.cover[data-cover]:not(.has-img)').forEach((el) => loadCover(el));
+  const r = parseRoute().name;
+  if (['home', 'discover', 'radio', 'oartist', 'search'].includes(r)) refresh();
+  if (netRetry && netRetry.id === curId) { const { pos, play } = netRetry; netRetry = null; reloadOnly = true; loadAndPlay(play, pos); }
+  if (lyricsOpen) renderLyrics(true);
+  sendPresence();
+  lyr.prefetch([...S.tracks.values()].filter((t) => !t.live && !isOnline(t)));
+}
+function setupNetwork() {
+  addEventListener('offline', setNetBanner);
+  addEventListener('online', () => { backOnline(); });
+  setNetBanner();
+}
 // iPhone-Startbildschirm-App: iOS gibt der App dort manchmal ein kürzeres Fenster als den Bildschirm.
 // Dann liegt der Rest schon über dem Home-Strich, und die untere Leiste braucht keinen Extra-Abstand.
 function fitStandalone() {
@@ -4721,6 +4771,7 @@ async function init() {
   setupMediaSession();
   setupQueueDrag();
   setupMiniSwipe();
+  setupNetwork();
   restoreOutput();
   renderSidebarPlaylists();
   updateProfileUI();
