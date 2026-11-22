@@ -175,6 +175,7 @@ function getArtists() {
     a.albums.add(albumKeyOf(t));
     if (!a.coverId && t.coverId) a.coverId = t.coverId;
   }
+  for (const a of m.values()) a.coverId = artistPicId(a.name) || a.coverId;
   _artists = m;
   return m;
 }
@@ -287,6 +288,97 @@ async function makeCover(blob) {
   } catch {
     return blob;
   }
+}
+
+/* ---------- Künstlerbilder ----------
+   Bilder aus Downloads\profilbilder (Dateiname = Künstlername) oder selbst gewählt.
+   Gespeichert unter „a:<name>“ im Cover-Speicher, damit sie auch offline da sind. */
+const nk = (s) => norm(s).replace(/[^a-z0-9]/g, '');
+const mainArtist = (s) => String(s || '').split(/\s*(?:,|&|\bfeat\.?\s|\bft\.?\s|\sx\s)\s*/i)[0].trim() || String(s || '');
+function artistPicId(name) {
+  for (const n of [name, mainArtist(name)]) { const id = 'a:' + nk(n); if (coverKeys.has(id)) return id; }
+  return null;
+}
+function lev(a, b) {
+  const d = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i++) {
+    let prev = d[0]; d[0] = i;
+    for (let j = 1; j <= b.length; j++) { const t = d[j]; d[j] = Math.min(d[j] + 1, d[j - 1] + 1, prev + (a[i - 1] === b[j - 1] ? 0 : 1)); prev = t; }
+  }
+  return d[b.length];
+}
+// Wie gut passt ein Dateiname zum Künstler? „caney“ → CANEY030, „ak“ → AK AUSSERKONTROLLE, „gansta ralph“ → GANGSTAR RALPH
+function picScore(artistKey, picKey) {
+  if (!picKey || !artistKey) return 0;
+  if (artistKey === picKey) return 100;
+  if (artistKey.replace(/\d+$/, '') === picKey) return 95;
+  if (picKey.length >= 2 && artistKey.startsWith(picKey)) return 80 + Math.min(10, picKey.length);
+  if (picKey.length >= 5 && lev(artistKey, picKey) <= 2) return 70;
+  return 0;
+}
+async function storeArtistPic(key, blob) {
+  const id = 'a:' + key;
+  await db.put('covers', { id, blob: await makeCover(blob) });
+  coverKeys.add(id);
+  const old = coverUrls.get(id);
+  if (old) { old.then((u) => u && URL.revokeObjectURL(u)); coverUrls.delete(id); }
+  tintCache.delete(id);
+  artCache.delete(id);
+}
+// Songs aus dem Musik-Ordner haben oft kein Cover: dann das Künstlerbild nehmen
+async function applyArtistPicsToTracks() {
+  const changed = [];
+  for (const t of S.tracks.values()) {
+    if (t.remote !== 'server' || (t.coverId && !t.coverId.startsWith('a:'))) continue;
+    const id = artistPicId(t.artist);
+    if (id && t.coverId !== id) { t.coverId = id; changed.push(t); }
+  }
+  if (changed.length) { try { await db.putMany('tracks', changed); } catch { /* */ } }
+  return changed.length;
+}
+async function syncArtistPics() {
+  let pics;
+  try {
+    const r = await fetch(withKey('/api/pics'), { cache: 'no-store' });
+    if (!r.ok) return;
+    pics = await r.json();
+  } catch { return; }
+  if (!Array.isArray(pics) || !pics.length) return;
+  const seen = ls.get('klang-apics', {});
+  const keys = new Set([...getArtists().values()].map((a) => nk(mainArtist(a.name))));
+  let changed = 0;
+  for (const key of keys) {
+    if (seen[key] === 'manual') continue; // selbst gewähltes Bild nicht überschreiben
+    let best = null, bs = 0;
+    for (const p of pics) { const sc = picScore(key, nk(p.name)); if (sc > bs) { bs = sc; best = p; } }
+    if (!best) continue;
+    const ver = `${best.url}|${best.v}`;
+    if (seen[key] === ver && coverKeys.has('a:' + key)) continue;
+    try {
+      const r = await fetch(withKey(best.url));
+      if (!r.ok) continue;
+      await storeArtistPic(key, await r.blob());
+      seen[key] = ver;
+      changed++;
+    } catch { /* nächstes Bild */ }
+  }
+  ls.set('klang-apics', seen);
+  const tracksChanged = await applyArtistPicsToTracks();
+  if (changed || tracksChanged) { invalidate(); refresh(); if (curId) updatePlayerUI(); }
+}
+async function changeArtistPic(name) {
+  const file = await pickFile('#image-input');
+  if (!file) return;
+  const key = nk(mainArtist(name));
+  await storeArtistPic(key, file);
+  const seen = ls.get('klang-apics', {});
+  seen[key] = 'manual';
+  ls.set('klang-apics', seen);
+  await applyArtistPicsToTracks();
+  invalidate();
+  refresh();
+  if (curId) updatePlayerUI();
+  toast('Künstlerbild gespeichert');
 }
 
 /* =========================================================
@@ -1661,7 +1753,7 @@ function pickFile(sel) {
 async function cleanupCovers(ids) {
   const used = new Set([...S.tracks.values()].map((t) => t.coverId));
   for (const id of ids) {
-    if (id && !used.has(id)) {
+    if (id && !used.has(id) && !id.startsWith('a:')) {
       await db.del('covers', id).catch(() => {});
       coverKeys.delete(id);
       const p = coverUrls.get(id);
@@ -2280,7 +2372,7 @@ views.artist = (name) => {
     .sort((a, b) => (parseInt(b.year, 10) || 0) - (parseInt(a.year, 10) || 0) || coll.compare(a.name, b.name));
   const allIds = albums.flatMap((a) => a.tracks.filter((t) => tracks.includes(t)).map((t) => t.id));
   const popular = tracks.slice().sort((a, b) => (b.playCount || 0) - (a.playCount || 0) || coll.compare(a.title, b.title)).slice(0, 5).map((t) => t.id);
-  const coverId = tracks.find((t) => t.coverId)?.coverId;
+  const coverId = artistPicId(displayName) || tracks.find((t) => t.coverId)?.coverId;
   const kAll = regList(allIds, { source: displayName });
   const kPop = regList(popular, { source: displayName, noHead: true });
   const dur = tracks.reduce((s, t) => s + (t.duration || 0), 0);
@@ -2289,7 +2381,7 @@ views.artist = (name) => {
       <div class="hero-info"><h1>${esc(displayName)}</h1>
       <p>Künstler · ${plural(albums.length, 'Album', 'Alben')} · ${plural(tracks.length, 'Titel', 'Titel')}${dur >= 60 ? ' · ' + fmtLong(dur) : ''}</p></div>
     </div>
-    <div class="actions-bar">${playButtons(kAll)}</div>
+    <div class="actions-bar">${playButtons(kAll)}<button class="btn btn-ghost btn-sm pic-btn" data-action="artist-pic" data-name="${esc(displayName)}" aria-label="Künstlerbild ändern" title="Künstlerbild ändern">${icon('image')}<span>Bild ändern</span></button></div>
     ${section('Beliebt', '', listEl(kPop, false))}
     ${section('Alben', '', `<div class="grid">${albums.map(albumCard).join('')}</div>`)}
     ${section('Alle Titel', '', listEl(kAll))}`;
@@ -2915,6 +3007,7 @@ const actions = {
   'play-list': (el) => { const L = listOf(el); if (L) playIds(L.ids, 0, { source: L.opts.source }); },
   'shuffle-list': (el) => { const L = listOf(el); if (L) playIds(L.ids, 0, { source: L.opts.source, shuffle: true }); },
   'play-album': (el) => { const a = getAlbums().get(el.dataset.key); if (a) playIds(a.tracks.map((t) => t.id), 0, { source: a.name }); },
+  'artist-pic': (el) => changeArtistPic(el.dataset.name),
   'play-artist': (el) => {
     const a = getArtists().get(el.dataset.name.toLowerCase());
     if (a) playIds(a.tracks.slice().sort((x, y) => coll.compare(x.album, y.album) || (x.trackNo || 0) - (y.trackNo || 0)).map((t) => t.id), 0, { source: a.name });
@@ -3339,6 +3432,7 @@ async function loadServerLibrary(showToast = false) {
     if (firstContact) refresh(); // Knopf „Für unterwegs“ einblenden
     if (showToast) toast(`Alles aktuell: ${plural(list.length, 'Song', 'Songs')} im Musik-Ordner`, 3000);
   }
+  syncArtistPics();
 }
 
 /* ---------- Für unterwegs: Songs vom PC als Paket aufs Handy ---------- */

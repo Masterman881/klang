@@ -1104,6 +1104,11 @@ body.is-live [data-action="shuffle"], body.is-live [data-action="repeat"] { opac
   .side-bottom .side-nav a { flex: 1; min-width: 0; padding: 0 8px; gap: 8px; }
   .side-bottom .side-nav a[data-action="color-menu"] { flex: 0 0 auto; font-size: 0; gap: 0; }
 }
+@media (max-width: 860px) {
+  .actions-bar .pic-btn { padding: 0 11px; }
+  .actions-bar .pic-btn span { display: none; }
+  .actions-bar > .btn-play { flex-shrink: 0; }
+}
 @media (min-width: 861px) and (max-height: 720px) {
   .np-art .cover { width: min(100%, 40vh); }
   .feature { height: clamp(440px, 78vh, 600px); }
