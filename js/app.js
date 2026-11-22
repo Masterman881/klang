@@ -672,8 +672,9 @@ function updatePosState() {
 
 // ---- Player-UI ----
 const npEls = {};
+let lastShownId = null;
 function cacheNpEls() {
-  for (const k of ['title', 'artist-link', 'cover', 'fav', 'play', 'shuffle', 'repeat', 'cur', 'dur', 'bar', 'source', 'sleep', 'sleep-label', 'vol-icon']) {
+  for (const k of ['title', 'artist-link', 'cover', 'fav', 'play', 'shuffle', 'repeat', 'cur', 'dur', 'bar', 'source', 'sleep', 'sleep-label', 'vol-icon', 'bug-label']) {
     npEls[k] = $$(`[data-np="${k}"]`);
   }
   npEls.seek = $$('[data-seek]');
@@ -698,7 +699,13 @@ async function updatePlayerUI() {
   });
   npEls.source.forEach((e) => { e.textContent = S.source || 'Deiner Bibliothek'; });
   updateFavUI();
+  updatePlayState();
   document.title = `${t.title} · ${t.artist}`;
+  if (lastShownId !== t.id) {
+    // Signatur-Moment: Der Score-Bug wischt bei jedem neuen Titel einmal herein
+    lastShownId = t.id;
+    $$('.pb-left, .np-meta').forEach((el) => { el.classList.remove('wipe'); void el.offsetWidth; el.classList.add('wipe'); });
+  }
   const id = curId;
   const tint = await tintOf(t.coverId);
   if (id !== curId) return;
@@ -719,6 +726,8 @@ function updatePlayState() {
   const playing = !audio.paused && !!curId;
   document.body.classList.toggle('is-playing', playing);
   npEls.play.forEach((e) => { e.innerHTML = icon(playing ? 'pause' : 'play'); });
+  const live = !!getT(curId)?.live;
+  npEls['bug-label'].forEach((e) => { e.textContent = live ? '● Live' : playing ? 'Läuft' : 'Pause'; });
   if ('mediaSession' in navigator) navigator.mediaSession.playbackState = curId ? (playing ? 'playing' : 'paused') : 'none';
 }
 function updateProgress() {
@@ -1280,8 +1289,8 @@ function listEl(k, head = true) {
   const o = lists[k].opts;
   const ids = lists[k].ids;
   const online = ids.length && ids.every((id) => getT(id)?.remote);
-  const h = head && !o.noHead ? `<div class="list-head"><span>#</span><span>Titel</span>${o.numbers ? '' : `<span>${online ? 'Genre' : 'Album'}</span>`}<span></span><span class="r">${icon('clock')}</span><span></span></div>` : '';
-  return `<div class="tracklist ${o.numbers ? 'no-album' : ''}" data-list="${k}">${h}</div>`;
+  const h = head && !o.noHead ? `<div class="list-head">${o.rank ? '<span>Platz</span>' : ''}<span>${o.rank ? '' : '#'}</span><span>Titel</span>${o.numbers ? '' : `<span>${online ? 'Genre' : 'Album'}</span>`}<span></span><span class="r">${icon('clock')}</span><span></span></div>` : '';
+  return `<div class="tracklist ${o.numbers ? 'no-album' : ''} ${o.rank ? 'ranked' : ''}" data-list="${k}">${h}</div>`;
 }
 const eqHTML = () => '<span class="eq"><i></i><i></i><i></i></span>';
 
@@ -1290,7 +1299,7 @@ function rowHTML(t, i, key, o) {
     ? `<div class="row-num"><span class="n">${t.trackNo || i + 1}</span>${eqHTML()}</div>`
     : coverHTML(t.coverId, t.album + t.artist, 'row-cover');
   return `<div class="row" data-id="${t.id}" data-list="${key}" data-i="${i}"${o.playlist && finePointer() ? ' draggable="true"' : ''}>
-    ${lead}
+    ${o.rank ? `<div class="row-rank ${i < 3 ? 'podium' : ''}">${i + 1}</div>` : ''}${lead}
     <div class="row-main"><div class="row-title">${o.numbers ? '' : eqHTML()}<span class="t">${esc(t.title)}</span></div><div class="row-sub">${esc(t.artist)}</div></div>
     <div class="row-album">${esc(t.remote ? t.genre || 'Online' : t.album)}</div>
     <button class="icon-btn row-fav ${t.fav ? 'on' : ''}" data-action="fav" aria-label="Favorit">${icon(t.fav ? 'heart-fill' : 'heart')}</button>
@@ -1410,20 +1419,14 @@ const settingsBtn = () => `<a class="icon-btn lg m-only" href="#/settings" aria-
 function emptyLib() {
   const folder = finePointer() && 'webkitdirectory' in document.createElement('input');
   return `<div class="empty">
-    <div class="big-ic">${icon('music')}</div>
-    <h2>Deine Musik, dein Player</h2>
-    <p>Füge deine eigenen Musikdateien hinzu (MP3, M4A, FLAC, OGG, WAV …). Sie werden nur auf diesem Gerät gespeichert. Kein Abo, keine Werbung, und es läuft auch offline.</p>
+    <h2>Deine Bibliothek ist noch leer</h2>
+    <p>Lade deine MP3s, M4As, FLACs oder WAVs. Sie bleiben auf diesem Gerät und spielen auch offline. Bis dahin läuft unten schon Musik von Audius und aus dem Radio.</p>
     <div class="btns">
       <button class="btn btn-accent" data-action="import-files">${icon('upload')}Dateien auswählen</button>
       ${folder ? `<button class="btn" data-action="import-folder">${icon('folder')}Ordner auswählen</button>` : ''}
       <a class="btn" href="#/discover">${icon('compass')}Online entdecken</a>
     </div>
-    ${finePointer() ? '<p class="hint">Du kannst Dateien und Ordner auch einfach ins Fenster ziehen.</p>' : ''}
-    <div class="feature-list">
-      <div><b>Online-Musik</b>Millionen freie Songs & tausende Radiosender</div>
-      <div><b>Playlists & Favoriten</b>Eigene und Online-Songs mischen</div>
-      <div><b>Sperrbildschirm</b>Steuerung über Kopfhörer & Lockscreen</div>
-    </div>
+    ${finePointer() ? '<p class="hint">Oder zieh Dateien und Ordner einfach ins Fenster.</p>' : ''}
   </div>`;
 }
 const notFound = () => `<div class="empty-small">Nicht gefunden. <a class="link" href="#/">Zur Startseite</a></div>`;
@@ -1453,7 +1456,7 @@ const after = {};
 views.home = () => {
   const hr = new Date().getHours();
   const greet = hr < 5 ? 'Gute Nacht' : hr < 11 ? 'Guten Morgen' : hr < 18 ? 'Guten Tag' : 'Guten Abend';
-  const online = section('Jetzt angesagt', '#/discover', '<div id="home-trending"></div>')
+  const online = section('Tabelle der Woche', '#/discover', '<div id="home-trending"></div>')
     + (radioFavs().length ? section('Meine Sender', '#/radio', '<div id="home-myradio"></div>') : '')
     + section('Radio hören', '#/radio', '<div id="home-radio"></div>');
   if (!S.tracks.size) return pageHead(greet, '', settingsBtn()) + emptyLib() + online;
@@ -1466,10 +1469,10 @@ views.home = () => {
   const artists = [...getArtists().values()].sort((a, b) => b.tracks.reduce((s, t) => s + (t.playCount || 0), 0) - a.tracks.reduce((s, t) => s + (t.playCount || 0), 0) || b.tracks.length - a.tracks.length).slice(0, 14);
 
   const tiles = [
-    `<a class="tile" href="#/favorites"><span class="tile-art grad">${icon('heart-fill')}</span><span class="tile-label"><span>Favoriten</span><small>${plural(favs, 'Titel', 'Titel')}</small></span></a>`,
-    `<button class="tile" data-action="shuffle-all"><span class="tile-art grad2">${icon('shuffle')}</span><span class="tile-label"><span>Zufallsmix</span><small>Alles durcheinander</small></span></button>`,
-    `<button class="tile" data-action="play-newest"><span class="tile-art grad3">${icon('sparkle')}</span><span class="tile-label"><span>Neu hinzugefügt</span><small>Die letzten 50 Titel</small></span></button>`,
-    top.length ? `<button class="tile" data-action="play-top"><span class="tile-art grad4">${icon('music')}</span><span class="tile-label"><span>Meistgespielt</span><small>Deine Top 50</small></span></button>` : '',
+    `<a class="tile" href="#/favorites"><span class="tile-art">${icon('heart-fill')}</span><span class="tile-label"><span>Favoriten</span><small>${plural(favs, 'Titel', 'Titel')}</small></span></a>`,
+    `<button class="tile" data-action="shuffle-all"><span class="tile-art">${icon('shuffle')}</span><span class="tile-label"><span>Zufallsmix</span><small>Alles durcheinander</small></span></button>`,
+    `<button class="tile" data-action="play-newest"><span class="tile-art">${icon('sparkle')}</span><span class="tile-label"><span>Neu hinzugefügt</span><small>Die letzten 50 Titel</small></span></button>`,
+    top.length ? `<button class="tile" data-action="play-top"><span class="tile-art">${icon('music')}</span><span class="tile-label"><span>Meistgespielt</span><small>Deine Top 50</small></span></button>` : '',
     ...S.playlists.slice(-2).reverse().map((p) => `<a class="tile" href="#/playlist/${p.id}">${playlistCover(p, 'mini').replace('class="cover', 'class="cover tile-art')}<span class="tile-label"><span>${esc(p.name)}</span><small>Playlist</small></span></a>`),
   ].join('');
 
@@ -1483,8 +1486,8 @@ views.home = () => {
 after.home = () => {
   fillAsync('#home-trending', async () => {
     const ids = adopt(await cached('trend:all:week', () => audius.trending(null, 'week', 50)));
-    const k = regList(ids, { source: 'Angesagt' });
-    return shelfOf(ids.slice(0, 16), k, onlineTrackCard);
+    const k = regList(ids.slice(0, 5), { source: 'Tabelle der Woche', rank: true, noHead: true });
+    return listEl(k, false);
   });
   const my = $('#home-myradio');
   if (my) {
@@ -1520,7 +1523,7 @@ after.discover = () => fillAsync('#disc-content', async () => {
   const tracks = await cached(`trend:${g[0]}:${S.discTime}`, () => audius.trending(g[2], S.discTime, 60));
   if (!tracks.length) return '<div class="empty-small">Hier ist gerade nichts im Trend. Probier ein anderes Genre.</div>';
   const ids = adopt(tracks);
-  const k = regList(ids, { source: `Angesagt · ${g[1]}` });
+  const k = regList(ids, { source: `Angesagt · ${g[1]}`, rank: true });
   const users = [];
   const seen = new Set();
   for (const t of tracks) {
@@ -1528,8 +1531,8 @@ after.discover = () => fillAsync('#disc-content', async () => {
   }
   const timeSel = `<select class="select" data-change="disc-time" aria-label="Zeitraum">${TIMES.map(([v, l]) => `<option value="${v}" ${v === S.discTime ? 'selected' : ''}>${l}</option>`).join('')}</select>`;
   return `<div class="actions-bar">${playButtons(k)}<span style="flex:1"></span>${timeSel}</div>`
-    + section('Künstler im Trend', '', `<div class="shelf">${users.slice(0, 14).map(oartistCard).join('')}</div>`)
-    + section('Top-Titel', '', listEl(k));
+    + section('Tabelle', '', listEl(k))
+    + section('Künstler im Trend', '', `<div class="shelf">${users.slice(0, 14).map(oartistCard).join('')}</div>`);
 });
 
 /* ---------- Radio ---------- */
@@ -1570,8 +1573,8 @@ after.oartist = (id) => fillAsync('#oartist-wrap', async () => {
   const total = tracks.reduce((s, t) => s + (t.duration || 0), 0);
   return `<div class="hero" style="--h:${hue(u.name)}" ${u.pic ? `data-tint="${esc(u.pic)}"` : ''}>
       ${coverHTML(u.pic, u.name, 'hero-art round', 'user')}
-      <div class="hero-info"><div class="eyebrow">${u.verified ? `<span class="verified">${icon('check')}</span> Verifizierter ` : ''}Künstler</div><h1>${esc(u.name)}</h1>
-      <p>${fmtCount(u.followers)} Follower · ${plural(ids.length, 'Titel', 'Titel')}${total ? ' · ' + fmtLong(total) : ''}</p></div>
+      <div class="hero-info"><h1>${esc(u.name)}</h1>
+      <p>${u.verified ? `<span class="verified" title="Verifiziert">${icon('check')}</span> Verifiziert · ` : ''}Künstler · ${fmtCount(u.followers)} Follower · ${plural(ids.length, 'Titel', 'Titel')}${total ? ' · ' + fmtLong(total) : ''}</p></div>
     </div>
     <div class="actions-bar">${ids.length ? playButtons(k) : ''}<span style="flex:1"></span><a class="btn btn-sm" href="https://audius.co/${encodeURIComponent(u.handle)}" target="_blank" rel="noopener">${icon('external')}Auf Audius</a></div>
     ${u.bio ? `<p class="muted bio">${esc(u.bio)}</p>` : ''}
@@ -1613,8 +1616,8 @@ views.album = (key) => {
   const k = regList(ids, { numbers: true, source: a.name });
   return `<div class="hero" style="--h:${hue(a.key)}" ${a.coverId ? `data-tint="${esc(a.coverId)}"` : ''}>
       ${coverHTML(a.coverId, a.key, 'hero-art')}
-      <div class="hero-info"><div class="eyebrow">Album</div><h1>${esc(a.name)}</h1>
-      <p><a class="link" href="#/artist/${encodeURIComponent(a.artist)}">${esc(a.artist)}</a>${a.year ? ' · ' + esc(a.year) : ''} · ${plural(ids.length, 'Titel', 'Titel')} · ${fmtLong(dur)}</p></div>
+      <div class="hero-info"><h1>${esc(a.name)}</h1>
+      <p>Album · <a class="link" href="#/artist/${encodeURIComponent(a.artist)}">${esc(a.artist)}</a>${a.year ? ' · ' + esc(a.year) : ''} · ${plural(ids.length, 'Titel', 'Titel')} · ${fmtLong(dur)}</p></div>
     </div>
     <div class="actions-bar">${playButtons(k)}<button class="icon-btn lg" data-action="album-menu" data-key="${esc(a.key)}" aria-label="Mehr">${icon('more')}</button></div>
     ${listEl(k)}`;
@@ -1642,8 +1645,8 @@ views.artist = (name) => {
   const dur = tracks.reduce((s, t) => s + (t.duration || 0), 0);
   return `<div class="hero" style="--h:${hue(displayName)}" ${coverId ? `data-tint="${esc(coverId)}"` : ''}>
       ${coverHTML(coverId, displayName, 'hero-art round')}
-      <div class="hero-info"><div class="eyebrow">Künstler</div><h1>${esc(displayName)}</h1>
-      <p>${plural(albums.length, 'Album', 'Alben')} · ${plural(tracks.length, 'Titel', 'Titel')} · ${fmtLong(dur)}</p></div>
+      <div class="hero-info"><h1>${esc(displayName)}</h1>
+      <p>Künstler · ${plural(albums.length, 'Album', 'Alben')} · ${plural(tracks.length, 'Titel', 'Titel')} · ${fmtLong(dur)}</p></div>
     </div>
     <div class="actions-bar">${playButtons(kAll)}</div>
     ${section('Beliebt', '', listEl(kPop, false))}
@@ -1655,9 +1658,9 @@ views.favorites = () => {
   S.lastLib = 'favorites';
   const ids = [...S.tracks.values()].filter((t) => t.fav).sort((a, b) => (b.favAt || 0) - (a.favAt || 0)).map((t) => t.id);
   const k = regList(ids, { source: 'Favoriten' });
-  const head = libTabs('favorites') + `<div class="hero" style="--tint: var(--accent)">
-      <div class="cover hero-art" style="background:linear-gradient(135deg,var(--accent),var(--accent-2));color:var(--on-accent)">${icon('heart-fill')}</div>
-      <div class="hero-info"><div class="eyebrow">Playlist</div><h1>Favoriten</h1><p>${plural(ids.length, 'Titel', 'Titel')}</p></div>
+  const head = libTabs('favorites') + `<div class="hero">
+      <div class="cover hero-art fav-art">${icon('heart-fill')}</div>
+      <div class="hero-info"><h1>Favoriten</h1><p>Playlist · ${plural(ids.length, 'Titel', 'Titel')}</p></div>
     </div>`;
   if (!ids.length) return head + '<div class="empty-small">Noch keine Favoriten. Tippe bei einem Titel auf das Herz.</div>';
   return head + `<div class="actions-bar">${playButtons(k)}</div>` + listEl(k);
@@ -1666,7 +1669,7 @@ views.favorites = () => {
 views.playlists = () => {
   const cards = [
     `<button class="card card-new" data-action="new-playlist" style="text-align:left"><div class="card-art"><div class="cover">${icon('plus')}</div></div><div class="card-title">Neue Playlist</div><div class="card-sub">Erstellen</div></button>`,
-    `<a class="card" href="#/favorites"><div class="card-art"><div class="cover" style="background:linear-gradient(135deg,var(--accent),var(--accent-2));color:var(--on-accent)">${icon('heart-fill')}</div><button class="card-play" data-action="play-favs" aria-label="Favoriten abspielen">${icon('play')}</button></div><div class="card-title">Favoriten</div><div class="card-sub">${plural([...S.tracks.values()].filter((t) => t.fav).length, 'Titel', 'Titel')}</div></a>`,
+    `<a class="card" href="#/favorites"><div class="card-art"><div class="cover fav-art">${icon('heart-fill')}</div><button class="card-play" data-action="play-favs" aria-label="Favoriten abspielen">${icon('play')}</button></div><div class="card-title">Favoriten</div><div class="card-sub">${plural([...S.tracks.values()].filter((t) => t.fav).length, 'Titel', 'Titel')}</div></a>`,
     ...S.playlists.slice().sort((a, b) => b.updatedAt - a.updatedAt).map(playlistCard),
   ];
   return pageHead('Playlists', plural(S.playlists.length, 'Playlist', 'Playlists'), settingsBtn()) + `<div class="grid">${cards.join('')}</div>`;
@@ -1681,8 +1684,8 @@ views.playlist = (id) => {
   const firstCover = ids.map((x) => S.tracks.get(x).coverId).find(Boolean);
   return `<div class="hero" style="--h:${hue(p.name)}" ${firstCover ? `data-tint="${esc(firstCover)}"` : ''}>
       ${playlistCover(p, 'hero')}
-      <div class="hero-info"><div class="eyebrow">Playlist</div><h1>${esc(p.name)}</h1>
-      <p>${plural(ids.length, 'Titel', 'Titel')}${ids.length ? ' · ' + fmtLong(dur) : ''}</p></div>
+      <div class="hero-info"><h1>${esc(p.name)}</h1>
+      <p>Playlist · ${plural(ids.length, 'Titel', 'Titel')}${ids.length ? ' · ' + fmtLong(dur) : ''}</p></div>
     </div>
     <div class="actions-bar">${ids.length ? playButtons(k) : ''}<button class="icon-btn lg" data-action="playlist-menu" data-id="${p.id}" aria-label="Mehr">${icon('more')}</button></div>
     ${ids.length ? listEl(k) : `<div class="empty-small">Diese Playlist ist noch leer.<br>Füge Titel über das ⋯-Menü bei einem Song hinzu.</div>`}`;
