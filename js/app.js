@@ -66,6 +66,21 @@ const remote = new Map();
 const getT = (id) => S.tracks.get(id) || remote.get(id);
 // Online = Audius/Radio. Songs aus dem lokalen Musik-Ordner (remote: 'server') zählen als eigene Musik.
 const isOnline = (t) => !!t?.remote && t.remote !== 'server';
+
+// Zugangsschlüssel zum Musik-Ordner auf dem PC (kommt per QR-Code aufs Handy, bleibt nur auf dem Gerät)
+const SRV_KEY = 'klang-srv-key';
+(() => {
+  const k = new URLSearchParams(location.search).get('k');
+  if (k) {
+    try { localStorage.setItem(SRV_KEY, k); } catch { /* */ }
+    history.replaceState(null, '', location.pathname + location.hash); // Schlüssel nicht in der Adresszeile lassen
+  }
+})();
+function withKey(url) {
+  let k = null;
+  try { k = localStorage.getItem(SRV_KEY); } catch { /* */ }
+  return k ? `${url}${url.includes('?') ? '&' : '?'}k=${encodeURIComponent(k)}` : url;
+}
 const hasT = (id) => S.tracks.has(id) || remote.has(id);
 function adopt(list) {
   return list.map((t) => {
@@ -458,7 +473,7 @@ async function loadAndPlay(autoplay = true, startAt = 0) {
       return;
     }
     if (t.remote !== 'server' && !navigator.onLine) toast('Keine Internetverbindung – Online-Titel brauchen Internet.', 3500);
-    src = t.streamUrl;
+    src = t.remote === 'server' ? withKey(t.streamUrl) : t.streamUrl;
   } else {
     let rec = null;
     try { rec = await db.get('audio', id); } catch { /* */ }
@@ -1830,7 +1845,7 @@ views.songs = () => {
   const ids = sortedTrackIds(S.sort.songs);
   const total = [...S.tracks.values()].reduce((s, t) => s + (t.duration || 0), 0);
   const k = regList(ids, { source: 'Alle Titel' });
-  return libTabs('songs') + pageHead('Titel', `${plural(ids.length, 'Titel', 'Titel')} · ${fmtLong(total)}`, `<button class="btn" data-action="import-files">${icon('plus')}Hinzufügen</button>`)
+  return libTabs('songs') + pageHead('Titel', `${plural(ids.length, 'Titel', 'Titel')}${total >= 60 ? ' · ' + fmtLong(total) : ''}`, `<button class="btn" data-action="import-files">${icon('plus')}Hinzufügen</button>`)
     + `<div class="actions-bar">${playButtons(k)}<span style="flex:1"></span>${sortSelect('songs', [['title', 'Titel A–Z'], ['artist', 'Künstler'], ['album', 'Album'], ['added', 'Zuletzt hinzugefügt'], ['plays', 'Meistgespielt']])}</div>`
     + listEl(k);
 };
@@ -2457,6 +2472,7 @@ const actions = {
   'import-files': () => { $('#file-input').value = ''; $('#file-input').click(); },
   'import-folder': () => { $('#folder-input').value = ''; $('#folder-input').click(); },
   'reload-server-lib': () => loadServerLibrary(true),
+  'phone-connect': () => phoneConnect(),
   toggle: () => togglePlay(),
   next: () => next(),
   prev: () => prev(),
@@ -2861,7 +2877,11 @@ function setupLaunchQueue() {
 async function loadServerLibrary(showToast = false) {
   let list;
   try {
-    const r = await fetch('/api/music', { cache: 'no-store' });
+    const r = await fetch(withKey('/api/music'), { cache: 'no-store' });
+    if (r.status === 403) {
+      if (showToast || !location.hostname.match(/^(localhost|127\.0\.0\.1)$/)) toast('Zugang zum Musik-Ordner fehlt. Scanne den QR-Code unter „Aufs Handy“ am PC neu.', 5000);
+      return;
+    }
     if (!r.ok || !(r.headers.get('content-type') || '').includes('json')) throw new Error('kein Musik-Server');
     list = await r.json();
     if (!Array.isArray(list)) throw new Error('unerwartete Antwort');
@@ -2871,6 +2891,8 @@ async function loadServerLibrary(showToast = false) {
     return;
   }
   $$('[data-server-lib]').forEach((b) => b.classList.remove('hidden'));
+  // „Aufs Handy“ nur am PC selbst anbieten
+  fetch('/api/lan', { cache: 'no-store' }).then((r) => { if (r.ok) $$('[data-phone-btn]').forEach((b) => b.classList.remove('hidden')); }).catch(() => {});
 
   if (!list.length) {
     if (showToast) toast('Im Musik-Ordner (Downloads\\music) liegen noch keine Songs.', 4000);
@@ -2912,6 +2934,62 @@ async function loadServerLibrary(showToast = false) {
   } else if (showToast) {
     toast(`Alles aktuell: ${plural(list.length, 'Song', 'Songs')} im Musik-Ordner`, 3000);
   }
+}
+
+/* ---------- Aufs Handy: QR-Code mit WLAN-Adresse und Schlüssel ---------- */
+function loadScript(src) {
+  return new Promise((res, rej) => {
+    if (document.querySelector(`script[src="${src}"]`)) { res(); return; }
+    const s = document.createElement('script');
+    s.src = src; s.onload = () => res(); s.onerror = rej;
+    document.head.appendChild(s);
+  });
+}
+const ipRank = (u) => (/\/\/192\.168\./.test(u) ? 0 : /\/\/10\./.test(u) ? 1 : /\/\/172\./.test(u) ? 2 : 3);
+async function phoneConnect() {
+  let info;
+  try {
+    const r = await fetch('/api/lan', { cache: 'no-store' });
+    if (!r.ok) throw new Error();
+    info = await r.json();
+  } catch { toast('„Aufs Handy“ geht nur am PC mit dem Klang-Server.'); return; }
+  if (!info.lan || !info.urls.length) {
+    openDialog({
+      title: 'Aufs Handy',
+      body: `<p>Damit dein Handy mithören kann, muss Klang im WLAN-Modus laufen:</p>
+        <ol class="steps">
+          <li>Das schwarze Klang-Fenster schließen.</li>
+          <li>Im Klang-Ordner auf <b>„Klang fürs Handy starten.bat“</b> doppelklicken.</li>
+          <li>Fragt Windows nach der Firewall: <b>Zulassen</b> für private Netzwerke.</li>
+          <li>Hier wieder auf <b>„Aufs Handy“</b> klicken.</li>
+        </ol>`,
+      buttons: [{ label: 'Verstanden', primary: true, value: 'ok' }],
+    });
+    return;
+  }
+  await loadScript('js/vendor/qrcode.js');
+  const urls = info.urls.slice().sort((a, b) => ipRank(a) - ipRank(b)).map((u) => `${u}?k=${encodeURIComponent(info.key)}`);
+  const qrSvg = (url) => { const qr = qrcode(0, 'M'); qr.addData(url); qr.make(); return qr.createSvgTag({ cellSize: 6, margin: 2, scalable: true, alt: 'QR-Code für Klang am Handy' }); };
+  const n = [...S.tracks.values()].filter((t) => t.remote === 'server').length;
+  openDialog({
+    title: 'Aufs Handy',
+    body: `<div class="qr" data-qr>${qrSvg(urls[0])}</div>
+      <ol class="steps">
+        <li>Handy ins <b>gleiche WLAN</b> wie diesen PC bringen.</li>
+        <li>Code mit der <b>Handy-Kamera</b> scannen und den Link öffnen.</li>
+        <li>Einloggen: ${n ? `deine ${n.toLocaleString('de')} Songs` : 'deine Songs'} spielen vom PC.</li>
+      </ol>
+      <p class="small muted">Das schwarze Klang-Fenster am PC muss dabei offen bleiben. Tipp: Im Handy-Browser „Zum Startbildschirm hinzufügen“, dann hast du ein Icon.</p>
+      ${urls.length > 1 ? `<p class="small muted">Klappt nicht? Andere Adresse probieren: ${urls.map((u, i) => `<button class="link qr-alt" type="button" data-qr-url="${esc(u)}">${esc(new URL(u).host)}</button>${i < urls.length - 1 ? ' · ' : ''}`).join('')}</p>` : ''}
+      <details class="small"><summary>Adresse zum Abtippen</summary><code class="qr-url">${esc(urls[0])}</code></details>`,
+    buttons: [{ label: 'Fertig', primary: true, value: 'ok' }],
+  });
+  $('#dialog-layer').addEventListener('click', (e) => {
+    const b = e.target.closest('[data-qr-url]');
+    if (!b) return;
+    $('#dialog-layer [data-qr]').innerHTML = qrSvg(b.dataset.qrUrl);
+    $('#dialog-layer .qr-url').textContent = b.dataset.qrUrl;
+  });
 }
 
 async function init() {
