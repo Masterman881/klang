@@ -880,6 +880,15 @@ body.is-live [data-action="shuffle"], body.is-live [data-action="repeat"] { opac
 .dlg details { margin-top: 10px; color: var(--muted); }
 .dlg summary { cursor: pointer; min-height: 32px; display: flex; align-items: center; }
 .dlg code { display: block; margin-top: 6px; padding: 10px 12px; border-radius: var(--r-sm); background: var(--bg2); border: 1px solid var(--line2); color: var(--text); font-size: 13px; word-break: break-all; user-select: all; }
+/* Große Überschriften: lange Wörter werden kleiner statt zerhackt (--len = längstes Wort) */
+.hero h1 { overflow-wrap: normal; font-size: min(clamp(46px, 6.4vw, 104px), calc((100vw - var(--side-w) - var(--gutter) * 2 - 290px) / (var(--len, 6) * .56))); }
+.page-head h1 { font-size: min(clamp(48px, 6vw, 84px), calc((100vw - var(--side-w) - var(--gutter) * 2) / (var(--len, 6) * .56))); }
+@media (max-width: 860px) {
+  .hero h1 { font-size: min(48px, calc((100vw - var(--gutter) * 2) / (var(--len, 6) * .56))); }
+  .page-head h1 { font-size: min(46px, calc((100vw - var(--gutter) * 2 - 110px) / (var(--len, 6) * .56))); }
+}
+.pack-btn { margin-left: 4px; }
+.pack-btn .ic { width: 17px; height: 17px; }
 .qr-alt { background: none; border: 0; padding: 0; font: inherit; color: var(--accent); cursor: pointer; }
 
 /* ============ Kino-Schnitte (View Transitions) ============ */

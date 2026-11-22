@@ -473,7 +473,7 @@ async function loadAndPlay(autoplay = true, startAt = 0) {
       return;
     }
     if (t.remote !== 'server' && !navigator.onLine) toast('Keine Internetverbindung – Online-Titel brauchen Internet.', 3500);
-    src = t.remote === 'server' ? withKey(t.streamUrl) : t.streamUrl;
+    src = t.remote === 'server' ? withKey(encPath(t.streamUrl)) : t.streamUrl;
   } else {
     let rec = null;
     try { rec = await db.get('audio', id); } catch { /* */ }
@@ -1048,9 +1048,63 @@ function getDuration(blob) {
   });
 }
 
+// ZIP-Pakete (z. B. „für unterwegs“) auspacken. Unterstützt unkomprimierte ZIPs (so baut sie Klang);
+// gelesen wird nur das Inhaltsverzeichnis, die Songs werden als Ausschnitte der Datei übernommen.
+const isZip = (f) => /\.zip$/i.test(f.name) || /zip/.test(f.type || '');
+async function unzipStored(file) {
+  const tailLen = Math.min(file.size, 65557);
+  const tail = new Uint8Array(await file.slice(file.size - tailLen).arrayBuffer());
+  let eocd = -1;
+  for (let i = tail.length - 22; i >= 0; i--) {
+    if (tail[i] === 0x50 && tail[i + 1] === 0x4b && tail[i + 2] === 0x05 && tail[i + 3] === 0x06) { eocd = i; break; }
+  }
+  if (eocd < 0) throw new Error('keine ZIP-Datei');
+  const tv = new DataView(tail.buffer, eocd);
+  const count = tv.getUint16(10, true);
+  const cdSize = tv.getUint32(12, true);
+  const cdOff = tv.getUint32(16, true);
+  const cd = new Uint8Array(await file.slice(cdOff, cdOff + cdSize).arrayBuffer());
+  const dv = new DataView(cd.buffer);
+  const out = [];
+  let skipped = 0;
+  for (let i = 0, p = 0; i < count && p + 46 <= cd.length; i++) {
+    if (dv.getUint32(p, true) !== 0x02014b50) break;
+    const flags = dv.getUint16(p + 8, true);
+    const method = dv.getUint16(p + 10, true);
+    const csize = dv.getUint32(p + 20, true);
+    const nlen = dv.getUint16(p + 28, true);
+    const xlen = dv.getUint16(p + 30, true);
+    const clen = dv.getUint16(p + 32, true);
+    const lho = dv.getUint32(p + 42, true);
+    const nameBytes = cd.subarray(p + 46, p + 46 + nlen);
+    const name = new TextDecoder(flags & 0x0800 ? 'utf-8' : 'windows-1252').decode(nameBytes);
+    p += 46 + nlen + xlen + clen;
+    if (name.endsWith('/') || /(^|\/)(__MACOSX|\.)/.test(name)) continue;
+    if (method !== 0) { skipped++; continue; } // komprimierte Einträge kann Klang nicht auspacken
+    const lh = new DataView(await file.slice(lho, lho + 30).arrayBuffer());
+    const start = lho + 30 + lh.getUint16(26, true) + lh.getUint16(28, true);
+    const base = name.split('/').pop();
+    const type = AUDIO_EXT.test(base) ? guessType(base) : /\.lrc$/i.test(base) ? 'text/plain' : '';
+    out.push({ file: new File([file.slice(start, start + csize)], base, { type }), path: name });
+  }
+  return { items: out, skipped };
+}
+
 let importing = false;
 async function importItems(items) {
   if (importing) { toast('Import läuft bereits …'); return []; }
+  if (items.some((x) => isZip(x.file))) {
+    const expanded = [];
+    for (const x of items) {
+      if (!isZip(x.file)) { expanded.push(x); continue; }
+      try {
+        const z = await unzipStored(x.file);
+        expanded.push(...z.items);
+        if (z.skipped) toast(`${plural(z.skipped, 'Datei', 'Dateien')} im ZIP sind gepackt und wurden übersprungen. Klang-Pakete gehen immer.`, 5000);
+      } catch { toast(`„${x.file.name}“ ist keine lesbare ZIP-Datei.`, 4000); }
+    }
+    items = expanded;
+  }
   const audioItems = items.filter((x) => isAudio(x.file));
   // Songtexte (.lrc) gehören zum Song mit gleichem Dateinamen
   const baseKey = (p) => p.replace(/\.[^./]+$/, '').toLowerCase();
@@ -1553,7 +1607,7 @@ function mountLists(root) {
 
 function playButtons(k) {
   return `<button class="btn-play" data-action="play-list" data-list="${k}" aria-label="Abspielen">${icon('play')}</button>
-    <button class="icon-btn lg" data-action="shuffle-list" data-list="${k}" title="Zufällig abspielen" aria-label="Zufällig abspielen">${icon('shuffle')}</button>`;
+    <button class="icon-btn lg" data-action="shuffle-list" data-list="${k}" title="Zufällig abspielen" aria-label="Zufällig abspielen">${icon('shuffle')}</button>${packBtn(k)}`;
 }
 
 // Kino-Wand-Kachel: quadratisches Cover; in Regalen wächst sie beim Fokus und zeigt Infos
@@ -1580,7 +1634,7 @@ function albumCard(a) {
     play: `<button class="card-play" data-action="play-album" data-key="${esc(a.key)}" aria-label="${esc(a.name)} abspielen">${icon('play')}</button>`,
     title: esc(a.name),
     sub: `${esc(a.artist)}${a.year ? ' · ' + esc(a.year) : ''}`,
-    info: { title: a.name, meta: `${esc(a.artist)}${a.year ? ' · ' + esc(a.year) : ''}`, line: `Album · ${plural(a.tracks.length, 'Titel', 'Titel')} · ${fmtLong(dur)}`, cta: 'Album öffnen' },
+    info: { title: a.name, meta: `${esc(a.artist)}${a.year ? ' · ' + esc(a.year) : ''}`, line: `Album · ${plural(a.tracks.length, 'Titel', 'Titel')}${dur >= 60 ? ' · ' + fmtLong(dur) : ''}`, cta: 'Album öffnen' },
   });
 }
 function artistCard(a) {
@@ -1872,7 +1926,7 @@ views.album = (key) => {
   return `<div class="hero" style="--h:${hue(a.key)}" ${a.coverId ? `data-tint="${esc(a.coverId)}"` : ''}>
       ${coverHTML(a.coverId, a.key, 'hero-art')}
       <div class="hero-info"><h1>${esc(a.name)}</h1>
-      <p>Album · <a class="link" href="#/artist/${encodeURIComponent(a.artist)}">${esc(a.artist)}</a>${a.year ? ' · ' + esc(a.year) : ''} · ${plural(ids.length, 'Titel', 'Titel')} · ${fmtLong(dur)}</p></div>
+      <p>Album · <a class="link" href="#/artist/${encodeURIComponent(a.artist)}">${esc(a.artist)}</a>${a.year ? ' · ' + esc(a.year) : ''} · ${plural(ids.length, 'Titel', 'Titel')}${dur >= 60 ? ' · ' + fmtLong(dur) : ''}</p></div>
     </div>
     <div class="actions-bar">${playButtons(k)}<button class="icon-btn lg" data-action="album-menu" data-key="${esc(a.key)}" aria-label="Mehr">${icon('more')}</button></div>
     ${listEl(k)}`;
@@ -1901,7 +1955,7 @@ views.artist = (name) => {
   return `<div class="hero" style="--h:${hue(displayName)}" ${coverId ? `data-tint="${esc(coverId)}"` : ''}>
       ${coverHTML(coverId, displayName, 'hero-art round')}
       <div class="hero-info"><h1>${esc(displayName)}</h1>
-      <p>Künstler · ${plural(albums.length, 'Album', 'Alben')} · ${plural(tracks.length, 'Titel', 'Titel')} · ${fmtLong(dur)}</p></div>
+      <p>Künstler · ${plural(albums.length, 'Album', 'Alben')} · ${plural(tracks.length, 'Titel', 'Titel')}${dur >= 60 ? ' · ' + fmtLong(dur) : ''}</p></div>
     </div>
     <div class="actions-bar">${playButtons(kAll)}</div>
     ${section('Beliebt', '', listEl(kPop, false))}
@@ -2427,6 +2481,8 @@ function render(keepScroll = false) {
   view.innerHTML = fn(r.arg);
   document.body.dataset.route = r.name;
   if (!['home', 'discover'].includes(r.name)) setAmbient(null);
+  // Lange Wörter in großen Überschriften nicht zerhacken: Schrift passt sich der Wortlänge an
+  $$('.hero h1, .page-head h1', view).forEach((h) => h.style.setProperty('--len', Math.max(4, ...h.textContent.trim().split(/\s+/).map((w) => w.length))));
   mountLists(view);
   hydrateCovers(view);
   applyTints(view);
@@ -2473,6 +2529,7 @@ const actions = {
   'import-folder': () => { $('#folder-input').value = ''; $('#folder-input').click(); },
   'reload-server-lib': () => loadServerLibrary(true),
   'phone-connect': () => phoneConnect(),
+  pack: (el) => packFor(el.dataset.list),
   toggle: () => togglePlay(),
   next: () => next(),
   prev: () => prev(),
@@ -2891,6 +2948,8 @@ async function loadServerLibrary(showToast = false) {
     return;
   }
   $$('[data-server-lib]').forEach((b) => b.classList.remove('hidden'));
+  const firstContact = !S.srvOK;
+  S.srvOK = true; // PC-Musikordner erreichbar: „Für unterwegs“ anbieten
   // „Aufs Handy“ nur am PC selbst anbieten
   fetch('/api/lan', { cache: 'no-store' }).then((r) => { if (r.ok) $$('[data-phone-btn]').forEach((b) => b.classList.remove('hidden')); }).catch(() => {});
 
@@ -2903,7 +2962,12 @@ async function loadServerLibrary(showToast = false) {
   const fresh = [];
   for (const item of list) {
     const id = 'srv:' + item.url;
-    if (S.tracks.has(id)) continue;
+    const known = S.tracks.get(id);
+    if (known) {
+      // Dateigröße nachtragen (für die Paketgröße „für unterwegs“)
+      if (item.size && known.size !== item.size) { known.size = item.size; fresh.push(known); }
+      continue;
+    }
     const title = item.file.replace(/\.[^.]+$/, '');
     const track = {
       id,
@@ -2916,7 +2980,7 @@ async function loadServerLibrary(showToast = false) {
       year: '', genre: '',
       trackNo: 0, discNo: 0,
       duration: 0,
-      fileName: item.file, size: 0,
+      fileName: item.file, size: item.size || 0,
       coverId: null,
       fav: false, favAt: 0, playCount: 0, lastPlayed: 0,
       addedAt: Date.now(),
@@ -2931,9 +2995,53 @@ async function loadServerLibrary(showToast = false) {
     invalidate();
     refresh();
     if (showToast) toast(`${plural(added, 'Titel', 'Titel')} aus Musik-Ordner geladen`, 3000);
-  } else if (showToast) {
-    toast(`Alles aktuell: ${plural(list.length, 'Song', 'Songs')} im Musik-Ordner`, 3000);
+  } else {
+    if (firstContact) refresh(); // Knopf „Für unterwegs“ einblenden
+    if (showToast) toast(`Alles aktuell: ${plural(list.length, 'Song', 'Songs')} im Musik-Ordner`, 3000);
   }
+}
+
+/* ---------- Für unterwegs: Songs vom PC als Paket aufs Handy ---------- */
+// Jeden Pfadteil einzeln kodieren, damit auch Namen mit # oder ? funktionieren
+const encPath = (p) => p.split('/').map((s) => encodeURIComponent(s)).join('/');
+function packBtn(k) {
+  if (!S.srvOK) return '';
+  const n = (lists[k]?.ids || []).filter((id) => getT(id)?.remote === 'server').length;
+  return n ? `<button class="btn btn-sm pack-btn" data-action="pack" data-list="${k}" title="Songs aufs Handy kopieren, offline hören">${icon('download')}Für unterwegs</button>` : '';
+}
+async function packFor(k) {
+  const L = lists[k];
+  if (!L) return;
+  const uniq = [...new Map(L.ids.map(getT).filter((t) => t?.remote === 'server').map((t) => [t.id, t])).values()];
+  if (!uniq.length) return;
+  const size = uniq.reduce((s, t) => s + (t.size || 0), 0);
+  const tooBig = size > 3.9e9;
+  const r = await openDialog({
+    title: 'Für unterwegs',
+    body: `<p><b>${plural(uniq.length, 'Song', 'Songs')}</b>${size ? ` · ca. ${fmtBytes(size)}` : ''} aus „${esc(L.opts.source || 'deiner Auswahl')}“</p>
+      ${tooBig ? '<p class="field-err">Das sind mehr als 3,9 GB. Bitte eine kleinere Playlist wählen.</p>' : `
+      <ol class="steps">
+        <li>Paket herunterladen (am besten im WLAN, das dauert etwas).</li>
+        <li>Deine <b>Klang-App</b> vom Startbildschirm öffnen.</li>
+        <li><b>Musik hinzufügen</b> tippen und die ZIP-Datei wählen.</li>
+      </ol>
+      <p class="small muted">Danach liegen die Songs auf dem Handy und laufen offline, auch ohne PC und ohne Internet. Platz auf dem Handy nicht vergessen.</p>`}`,
+    buttons: tooBig ? [{ label: 'Schließen', primary: true }] : [{ label: 'Abbrechen' }, { label: 'Paket herunterladen', primary: true, value: 'ok' }],
+  });
+  if (!r || tooBig) return;
+  let res;
+  try {
+    res = await fetch(withKey('/api/pack'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ files: uniq.map((t) => encPath(t.streamUrl)) }) });
+  } catch { toast('Der PC ist nicht erreichbar. Läuft das schwarze Klang-Fenster?', 4500); return; }
+  const d = await res.json().catch(() => ({}));
+  if (!res.ok) { toast(d.error || 'Das Paket konnte nicht erstellt werden.', 4500); return; }
+  const a = document.createElement('a');
+  a.href = withKey(`/api/pack/${d.id}`);
+  a.download = '';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  toast(`Download startet: ${plural(d.count, 'Song', 'Songs')}, ${fmtBytes(d.size)}. Danach in der Klang-App unter „Musik hinzufügen“ wählen.`, 7000);
 }
 
 /* ---------- Aufs Handy: QR-Code mit WLAN-Adresse und Schlüssel ---------- */
