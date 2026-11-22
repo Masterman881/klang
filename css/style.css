@@ -1443,4 +1443,3 @@ html { background: var(--bg); }
 /* Login: Cover-Wand und Abdunklung reichen über den ganzen Bildschirm (auch unter dem Home-Strich am iPhone) */
 .auth-shade { inset: -25% -10%; }
 .auth-wall { -webkit-mask-image: linear-gradient(to bottom, #000 0%, #000 55%, transparent 88%); mask-image: linear-gradient(to bottom, #000 0%, #000 55%, transparent 88%); }
-.ios-short .auth { bottom: auto; height: calc(100% + env(safe-area-inset-top, 0px) + env(safe-area-inset-bottom, 0px) + 60px); }
