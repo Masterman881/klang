@@ -102,6 +102,7 @@ input, textarea { caret-color: var(--accent); }
   background: var(--bg);
   border-right: 1px solid var(--line);
   min-height: 0;
+  overflow-y: auto; overflow-x: hidden; scrollbar-width: thin;
   view-transition-name: sidebar;
 }
 #main {
@@ -139,7 +140,9 @@ input, textarea { caret-color: var(--accent); }
 .side-scroll { flex: 1; overflow-y: auto; min-height: 60px; }
 .side-scroll a { font-family: var(--sans); text-transform: none; letter-spacing: 0; font-size: 14.5px; min-height: 38px; }
 .side-scroll .empty-hint { color: var(--faint); font-size: 13.5px; padding: 4px 14px; }
-.side-bottom { display: flex; flex-direction: column; gap: 8px; padding-top: 14px; border-top: 1px solid var(--line); }
+.side-bottom { display: flex; flex-direction: column; gap: 8px; padding-top: 14px; border-top: 1px solid var(--line);
+  /* bleibt unten stehen, wenn die Seitenleiste in niedrigen Fenstern scrollt */
+  position: sticky; bottom: -14px; z-index: 2; margin-bottom: -14px; padding-bottom: 14px; background: var(--bg); }
 
 /* ============ Buttons ============ */
 .btn {
@@ -1082,6 +1085,24 @@ body.is-live [data-action="shuffle"], body.is-live [data-action="repeat"] { opac
   .pb-right .vol { width: 72px; }
   .ft-body { gap: 32px; }
   .tracklist.ranked .list-head, .tracklist.ranked .row { grid-template-columns: 40px 46px minmax(0, 1.4fr) minmax(0, .8fr) 42px 54px 42px; gap: 10px; }
+}
+/* Niedrige Fenster (z. B. Laptop, Browser mit vielen Leisten): Seitenleiste verdichten,
+   damit „Musik hinzufügen“, „Musik-Ordner laden“ und „Aufs Handy“ sichtbar bleiben */
+@media (min-width: 861px) and (max-height: 1000px) {
+  #sidebar { padding: 18px 16px 10px; }
+  .brand { padding-bottom: 16px; }
+  .side-profile { margin: -4px 0 8px; padding: 8px 12px; }
+  .side-nav { gap: 2px; }
+  .side-nav a { min-height: 36px; }
+  .side-label { padding: 14px 14px 6px; }
+  .side-scroll { min-height: 36px; }
+  .side-scroll a { min-height: 34px; }
+  .side-bottom { gap: 6px; padding-top: 10px; bottom: -10px; margin-bottom: -10px; padding-bottom: 10px; }
+  .brand { padding-bottom: 14px; }
+  .side-bottom .btn { min-height: 38px; padding: 0 10px; gap: 8px; letter-spacing: .06em; }
+  .side-bottom .side-nav { flex-direction: row; }
+  .side-bottom .side-nav a { flex: 1; min-width: 0; padding: 0 8px; gap: 8px; }
+  .side-bottom .side-nav a[data-action="color-menu"] { flex: 0 0 auto; font-size: 0; gap: 0; }
 }
 @media (min-width: 861px) and (max-height: 720px) {
   .np-art .cover { width: min(100%, 40vh); }

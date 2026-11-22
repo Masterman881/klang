@@ -2429,6 +2429,11 @@ views.settings = () => {
         ${folder ? `<button class="btn" data-action="import-folder">${icon('folder')}Ordner hinzufügen</button>` : ''}
       </div>
     </div>
+    ${S.srvOK && /^(localhost|127\.0\.0\.1|\[::1\])$/.test(location.hostname) ? `<div class="set-card">
+      <h2>Aufs Handy</h2>
+      <p>Deine Songs aus dem Musik-Ordner am Handy hören: QR-Code scannen, fertig. Mit „Für unterwegs“ kommen sie danach auch offline aufs Handy.</p>
+      <button class="btn btn-accent" data-action="phone-connect">${icon('phone')}QR-Code zeigen</button>
+    </div>` : ''}
     <div class="set-card">
       <h2>Speicher</h2>
       <p>Deine Musik liegt nur auf diesem Gerät, im Speicher des Browsers bzw. der App.</p>
