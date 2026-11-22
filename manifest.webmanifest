@@ -1,33 +1,101 @@
 {
-  "name": "Klang – Deine Musik",
-  "short_name": "Klang",
-  "description": "Dein eigener Musikplayer – offline, werbefrei, kostenlos.",
+  "name": "VERS – Deine Musik",
+  "short_name": "VERS",
+  "description": "Deine Musik, deine Texte, deine Statistik. Werbefrei, offline, auf PC und Handy.",
   "id": "./",
   "start_url": "./",
   "scope": "./",
   "display": "standalone",
   "orientation": "any",
-  "background_color": "#0a0f1e",
-  "theme_color": "#0a0f1e",
+  "background_color": "#0c0a09",
+  "theme_color": "#08080a",
   "lang": "de",
-  "categories": ["music", "entertainment"],
+  "categories": [
+    "music",
+    "entertainment"
+  ],
   "icons": [
-    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
-    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
-    { "src": "icons/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" },
-    { "src": "icons/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+    {
+      "src": "icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "icons/icon-maskable-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    },
+    {
+      "src": "icons/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
   ],
   "file_handlers": [
     {
       "action": "./",
       "accept": {
-        "audio/mpeg": [".mp3"],
-        "audio/mp4": [".m4a"],
-        "audio/flac": [".flac"],
-        "audio/ogg": [".ogg", ".opus"],
-        "audio/wav": [".wav"]
+        "audio/mpeg": [
+          ".mp3"
+        ],
+        "audio/mp4": [
+          ".m4a"
+        ],
+        "audio/flac": [
+          ".flac"
+        ],
+        "audio/ogg": [
+          ".ogg",
+          ".opus"
+        ],
+        "audio/wav": [
+          ".wav"
+        ]
       }
     }
   ],
-  "launch_handler": { "client_mode": "focus-existing" }
+  "launch_handler": {
+    "client_mode": "focus-existing"
+  },
+  "shortcuts": [
+    {
+      "name": "Suchen",
+      "url": "./#/search",
+      "icons": [
+        {
+          "src": "icons/icon-192.png",
+          "sizes": "192x192"
+        }
+      ]
+    },
+    {
+      "name": "Statistik",
+      "url": "./#/stats",
+      "icons": [
+        {
+          "src": "icons/icon-192.png",
+          "sizes": "192x192"
+        }
+      ]
+    },
+    {
+      "name": "Favoriten",
+      "url": "./#/favorites",
+      "icons": [
+        {
+          "src": "icons/icon-192.png",
+          "sizes": "192x192"
+        }
+      ]
+    }
+  ]
 }

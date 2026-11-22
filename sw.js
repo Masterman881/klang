@@ -1,6 +1,6 @@
-// Service Worker: macht Klang offline-fähig und installierbar.
+// Service Worker: macht VERS offline-fähig und installierbar.
 // Bei Änderungen an der App die Versionsnummer erhöhen.
-const CACHE = 'klang-v15';
+const CACHE = 'vers-v16';
 const ASSETS = [
   './',
   'index.html',
@@ -20,11 +20,15 @@ const ASSETS = [
   'js/icons.js',
   'js/online.js',
   'js/auth.js',
+  'js/lyrics.js',
+  'js/stats.js',
   'manifest.webmanifest',
   'icons/icon.svg',
   'icons/icon-192.png',
   'icons/icon-512.png',
   'icons/icon-maskable-512.png',
+  'icons/favicon-32.png',
+  'icons/apple-touch-icon.png',
 ];
 
 self.addEventListener('install', (e) => {
@@ -47,7 +51,7 @@ self.addEventListener('fetch', (e) => {
   if (url.origin !== self.location.origin) return;
   // Musik-Ordner vom lokalen Server: Liste immer frisch, Audio direkt streamen (Teil-Antworten,
   // große Dateien) – beides nie über den Cache leiten.
-  if (url.pathname.startsWith('/api/') || url.pathname.startsWith('/music/') || req.headers.has('range')) return;
+  if (/^\/(api|music|covers|pics)\//.test(url.pathname) || req.headers.has('range')) return;
 
   const network = fetch(req)
     .then(async (res) => {

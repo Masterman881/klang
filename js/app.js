@@ -3,6 +3,8 @@ import { readTags } from './tags.js';
 import { icon, hydrateIcons } from './icons.js';
 import { audius, radio } from './online.js';
 import * as auth from './auth.js';
+import * as lyr from './lyrics.js';
+import * as stats from './stats.js';
 
 /* =========================================================
    Helfer
@@ -78,7 +80,7 @@ const SRV_KEY = 'klang-srv-key';
     history.replaceState(null, '', location.pathname + location.hash); // Schlüssel nicht in der Adresszeile lassen
   }
 })();
-// Privater Cloud-Speicher (Cloudflare R2 hinter dem Klang-Worker). Zugang kommt per QR-Code als #cloud=…&ck=…
+// Privater Cloud-Speicher (Cloudflare R2 hinter dem VERS-Worker). Zugang kommt per QR-Code als #cloud=…&ck=…
 const CLOUD = 'klang-cloud';
 function takeCloudLink(text) {
   const m = /#cloud=([^&\s]+)&ck=([^&\s#]+)/.exec(String(text || ''));
@@ -179,20 +181,31 @@ function getAlbums() {
   return m;
 }
 
+// Alle Künstler eines Titels (Hauptkünstler zuerst, dann Features)
+const splitNames = (s) => String(s || '').split(/\s*(?:,|\/|;|\bfeat\.?\s|\bft\.?\s)\s*/i).map((x) => x.trim()).filter(Boolean);
+const artistsOf = (t) => (t.artists?.length ? t.artists : splitNames(t.artist));
+const artKey = (name) => nk(name) || String(name || '').toLowerCase();
 function getArtists() {
   if (_artists) return _artists;
   const m = new Map();
   for (const t of S.tracks.values()) {
-    const k = t.artist.toLowerCase();
-    let a = m.get(k);
-    if (!a) { a = { key: k, name: t.artist, tracks: [], albums: new Set(), coverId: null }; m.set(k, a); }
-    a.tracks.push(t);
-    a.albums.add(albumKeyOf(t));
-    if (!a.coverId && t.coverId) a.coverId = t.coverId;
+    artistsOf(t).forEach((name, i) => {
+      const k = artKey(name);
+      let a = m.get(k);
+      if (!a) { a = { key: k, name, tracks: [], lead: 0, albums: new Set(), coverId: null }; m.set(k, a); }
+      a.tracks.push(t);
+      if (i === 0) { a.lead++; a.albums.add(albumKeyOf(t)); }
+    });
   }
-  for (const a of m.values()) a.coverId = artistPicId(a.name) || a.coverId;
+  // Künstlerbild nur aus echten Künstlerbildern, nie aus Song-Covern
+  for (const a of m.values()) a.coverId = artistPicId(a.name);
   _artists = m;
   return m;
+}
+const isMainArtist = (a) => a.lead >= 2 || !!a.coverId;
+const initials = (name) => { const w = String(name || '?').replace(/[^\p{L}\p{N} ]/gu, ' ').trim().split(/\s+/); return (w.length > 1 ? w[0][0] + w[1][0] : (w[0] || '?').slice(0, 2)).toUpperCase(); };
+function artistArt(name, pic, cls = '') {
+  return pic ? coverHTML(pic, name, `${cls} round`, 'user') : `<div class="cover ${cls} round mono" style="--h:${hue(name)}"><span>${esc(initials(name))}</span></div>`;
 }
 
 const searchStr = (t) => {
@@ -205,6 +218,7 @@ const searchStr = (t) => {
    Cover
    ========================================================= */
 const coverUrls = new Map();
+let coverBase = null; // (Datei) => Adresse der Song-Cover vom PC bzw. aus der Cloud
 let coverKeys = new Set();
 const tintCache = new Map();
 
@@ -226,7 +240,22 @@ function coverUrl(id) {
     return coverUrls.get(id);
   }
   if (!coverUrls.has(id)) {
-    coverUrls.set(id, db.get('covers', id).then((r) => (r ? URL.createObjectURL(r.blob) : null)).catch(() => null));
+    const p = (async () => {
+      const r = await db.get('covers', id).catch(() => null);
+      if (r) return URL.createObjectURL(r.blob);
+      // Song-Cover aus dem Katalog (PC oder Cloud): einmal laden, verkleinert speichern, danach offline
+      if (!id.startsWith('c:') || !coverBase) return null;
+      try {
+        const res = await fetch(coverBase(id.slice(2)));
+        if (!res.ok) return null;
+        const blob = await makeCover(await res.blob());
+        db.put('covers', { id, blob }).catch(() => {});
+        coverKeys.add(id);
+        return URL.createObjectURL(blob);
+      } catch { return null; }
+    })();
+    coverUrls.set(id, p);
+    p.then((u) => { if (!u) coverUrls.delete(id); }); // später nochmal versuchen
   }
   return coverUrls.get(id);
 }
@@ -340,14 +369,10 @@ async function storeArtistPic(key, blob) {
   tintCache.delete(id);
   artCache.delete(id);
 }
-// Songs aus dem Musik-Ordner haben oft kein Cover: dann das Künstlerbild nehmen
+// Künstlerbilder sind nie Song-Cover: alte Zuordnungen aus früheren Versionen entfernen
 async function applyArtistPicsToTracks() {
   const changed = [];
-  for (const t of S.tracks.values()) {
-    if ((t.remote !== 'server' && t.remote !== 'cloud') || (t.coverId && !t.coverId.startsWith('a:'))) continue;
-    const id = artistPicId(t.artist);
-    if (id && t.coverId !== id) { t.coverId = id; changed.push(t); }
-  }
+  for (const t of S.tracks.values()) if (t.coverId?.startsWith('a:')) { t.coverId = null; changed.push(t); }
   if (changed.length) { try { await db.putMany('tracks', changed); } catch { /* */ } }
   return changed.length;
 }
@@ -550,15 +575,15 @@ window.addEventListener('popstate', () => {
 /* =========================================================
    Player
    ========================================================= */
-// Zwei Abspieler: einer direkt (geht immer, auch im Hintergrund auf dem iPhone),
-// einer durch den Equalizer (braucht CORS-Freigabe der Quelle). `audio` zeigt auf den aktiven.
-const plainEl = new Audio();
-const eqEl = new Audio();
-eqEl.crossOrigin = 'anonymous';
-plainEl.preload = eqEl.preload = 'auto';
-let audio = plainEl;
+// Vier Abspieler: je zwei direkt (gehen immer, auch im Hintergrund auf dem iPhone) und je zwei durch den
+// Equalizer (brauchen CORS-Freigabe der Quelle). Je zwei, damit der nächste Song vorab lädt
+// (lückenlos) und beide beim Überblenden gleichzeitig laufen können. `audio` zeigt auf den aktiven.
+const mkAudio = (cors) => { const a = new Audio(); if (cors) a.crossOrigin = 'anonymous'; a.preload = 'auto'; return a; };
+const decks = { plain: [mkAudio(false), mkAudio(false)], eq: [mkAudio(true), mkAudio(true)] };
+const allEls = [...decks.plain, ...decks.eq];
+const isEqEl = (el) => decks.eq.includes(el);
+let audio = decks.plain[0];
 const noCors = new Set(); // Quellen ohne Freigabe: laufen ohne Equalizer
-let audioUrl = null;
 let curId = null;
 let loadToken = 0;
 let wantPlay = false;
@@ -569,6 +594,187 @@ let lastSave = 0;
 let deferred = null; // Online-Titel nach Neustart erst beim Antippen laden
 let reloadOnly = false;
 
+// Wiedergabe-Einstellungen
+const PB = Object.assign({ xfade: 0, gapless: true, smartMix: 'balanced', shareStatus: true }, ls.get('klang-playback', {}));
+const savePB = () => ls.set('klang-playback', PB);
+// iPhone/iPad: Lautstärke einzelner Abspieler lässt sich nicht regeln und ein zweiter Abspieler startet
+// im Hintergrund nicht zuverlässig. Dort bleibt es bei einem Abspieler.
+const canSetVolume = (() => { try { const a = new Audio(); a.volume = 0.5; return a.volume === 0.5; } catch { return false; } })();
+const decksOK = () => canSetVolume;
+const xfadeSecs = () => (decksOK() ? PB.xfade : 0);
+
+// Lautstärke gehört der App, nicht dem Abspieler (beim Überblenden laufen zwei gleichzeitig)
+const vol = { level: 1, muted: false };
+const volFactor = new Map(); // Abspieler -> 0..1 beim Überblenden
+function applyVol(el) {
+  const f = volFactor.has(el) ? volFactor.get(el) : 1;
+  el.muted = vol.muted;
+  el.volume = Math.max(0, Math.min(1, vol.level * f));
+}
+function setVolume(level = vol.level, muted = vol.muted) {
+  vol.level = Math.max(0, Math.min(1, level));
+  vol.muted = !!muted;
+  for (const el of allEls) applyVol(el);
+  updateVolumeUI();
+}
+const fades = new Map();
+function cancelFade(el) { clearTimeout(fades.get(el)); fades.delete(el); }
+// Gleichmäßig laut überblenden (equal power): rein mit Sinus, raus mit Kosinus
+function fade(el, dir, secs, done) {
+  cancelFade(el);
+  const t0 = performance.now();
+  const step = () => {
+    const k = secs > 0 ? Math.min(1, (performance.now() - t0) / (secs * 1000)) : 1;
+    volFactor.set(el, dir === 'in' ? Math.sin(k * Math.PI / 2) : Math.cos(k * Math.PI / 2));
+    applyVol(el);
+    if (k < 1) fades.set(el, setTimeout(step, 30));
+    else { fades.delete(el); if (dir === 'in') { volFactor.delete(el); applyVol(el); } done?.(); }
+  };
+  step();
+}
+const objUrls = new Map();
+function clearEl(el) {
+  cancelFade(el);
+  el.pause();
+  if (el.getAttribute('src')) { el.removeAttribute('src'); el.load(); }
+  const u = objUrls.get(el);
+  if (u) { URL.revokeObjectURL(u); objUrls.delete(el); }
+  volFactor.delete(el);
+  applyVol(el);
+}
+async function sourceFor(t) {
+  if (t.remote) return { src: t.remote === 'server' ? withKey(encPath(t.streamUrl)) : t.remote === 'cloud' ? cloudSrc(t.streamUrl) : t.streamUrl };
+  let rec = null;
+  try { rec = await db.get('audio', t.id); } catch { /* */ }
+  if (!rec) return null;
+  const u = URL.createObjectURL(rec.blob);
+  return { src: u, obj: u };
+}
+function setSrc(el, s) {
+  clearEl(el);
+  el.src = s.src;
+  if (s.obj) objUrls.set(el, s.obj);
+}
+const wantsEq = (id) => eq.on && !noCors.has(id);
+
+// ---- Nächsten Song vorbereiten (lückenlos / Überblenden) ----
+let prep = null; // { id, el }
+let preparing = false;
+let gapTimer = null;
+function upcomingIndex() {
+  if (!S.queue.length || S.repeat === 'one') return -1;
+  if (S.index < S.queue.length - 1) return S.index + 1;
+  return S.repeat === 'all' && S.queue.length > 1 ? 0 : -1;
+}
+function dropPrep() {
+  if (!prep) return;
+  if (prep.el !== audio) clearEl(prep.el);
+  prep = null;
+}
+async function prepareNext() {
+  if (prep || preparing || !decksOK()) return;
+  const i = upcomingIndex();
+  if (i < 0) return;
+  const id = S.queue[i];
+  const t = getT(id);
+  if (!t || t.live || (isOnline(t) && !navigator.onLine)) return;
+  preparing = true;
+  try {
+    const we = wantsEq(id);
+    if (we) ensureEqGraph();
+    const [a, b] = we ? decks.eq : decks.plain;
+    const el = a === audio || fades.has(a) ? b : a;
+    if (el === audio) return;
+    const s = await sourceFor(t);
+    if (!s) return;
+    if (S.queue[upcomingIndex()] !== id || el === audio) { if (s.obj) URL.revokeObjectURL(s.obj); return; }
+    setSrc(el, s);
+    el.load();
+    prep = { id, el };
+  } finally { preparing = false; }
+}
+function prepValid() {
+  return !!prep && S.queue[upcomingIndex()] === prep.id && isEqEl(prep.el) === wantsEq(prep.id) && !prep.el.error && prep.el !== audio;
+}
+// Automatisch zum vorbereiteten Song wechseln: xf Sekunden überblenden, 0 = nahtlos
+function advanceAuto(xf) {
+  if (!prepValid()) { dropPrep(); return false; }
+  const i = upcomingIndex();
+  const t = getT(prep.id);
+  if (!t) return false;
+  const old = audio;
+  const el = prep.el;
+  prep = null;
+  clearTimeout(gapTimer); gapTimer = null;
+  S.index = i;
+  curId = t.id;
+  audio = el;
+  loadToken++;
+  deferred = null;
+  wantPlay = true;
+  if (isEqEl(el)) eq.ctx?.resume();
+  if (xf > 0) { volFactor.set(el, 0); applyVol(el); fade(el, 'in', xf); fade(old, 'out', xf, () => clearEl(old)); }
+  else { volFactor.delete(el); applyVol(el); fade(old, 'out', 0.04, () => clearEl(old)); }
+  el.play().catch(() => { clearEl(el); audio = old; loadAndPlay(true); });
+  onTrackStart(t);
+  afterTrackChange();
+  return true;
+}
+function checkTransition() {
+  if (!decksOK() || (!PB.gapless && !PB.xfade)) return;
+  const t = getT(curId);
+  if (!t || t.live || audio.paused || seeking) return;
+  const d = audio.duration;
+  if (!Number.isFinite(d) || d < 15) return;
+  if (prep && !prepValid()) dropPrep();
+  const rem = d - audio.currentTime;
+  if (rem < 25 && !prep) prepareNext();
+  if (!prep || S.sleep?.mode === 'end') return;
+  const xf = Math.min(xfadeSecs(), d / 3);
+  if (xf > 0 && rem <= xf) advanceAuto(xf);
+  else if (!xf && PB.gapless && rem < 0.7 && !gapTimer) {
+    gapTimer = setTimeout(() => { gapTimer = null; if (audio.duration - audio.currentTime < 0.7) advanceAuto(0); }, Math.max(0, (rem - 0.06) * 1000));
+  }
+}
+
+// ---- Zählen: echte Hörzeit, „gespielt“ erst nach 30 s bzw. halber Länge ----
+let listened = 0, credited = false, lastPos = null;
+function onTrackStart(t) {
+  t.lastPlayed = Date.now();
+  if (S.tracks.has(t.id)) { db.put('tracks', t); _albums = null; }
+  listened = 0; credited = false; lastPos = null;
+  topUpSmart();
+}
+function listenTick() {
+  const c = audio.currentTime || 0;
+  if (!audio.paused && !seeking && lastPos != null) {
+    const d = c - lastPos;
+    const t = getT(curId);
+    if (t && d > 0 && d < 3) {
+      stats.tick(t, d);
+      listened += d;
+      const dur = t.duration || audio.duration || 0;
+      if (!credited && !t.live && (listened >= 30 || (dur && listened >= dur * 0.5))) {
+        credited = true;
+        stats.countPlay(t);
+        t.playCount = (t.playCount || 0) + 1;
+        if (S.tracks.has(t.id)) { db.put('tracks', t); _albums = null; }
+      }
+    }
+  }
+  lastPos = c;
+}
+function afterTrackChange() {
+  updatePlayerUI();
+  updateMediaSession();
+  markPlaying();
+  saveState();
+  sendPresence();
+  if (overlays.includes('queue')) renderQueue();
+  const t = getT(curId);
+  if (t && !t.live) lyr.get(t).then(() => { if (lyricsOpen && curId === t.id) renderLyrics(true); }).catch(() => {});
+}
+
 async function loadAndPlay(autoplay = true, startAt = 0) {
   const id = S.queue[S.index];
   const t = getT(id);
@@ -578,48 +784,47 @@ async function loadAndPlay(autoplay = true, startAt = 0) {
   const token = ++loadToken;
   wantPlay = autoplay;
   deferred = null;
-  let src;
-  if (t.remote) {
-    if (t.live) startAt = 0;
-    if (!autoplay) {
-      // Nicht schon beim App-Start Daten aus dem Netz laden
-      curId = id;
-      deferred = { startAt };
-      audio.pause();
-      audio.removeAttribute('src');
-      updatePlayerUI(); updateMediaSession(); markPlaying(); updatePlayState(); updateProgress();
-      return;
-    }
-    if (t.remote !== 'server' && !navigator.onLine) toast('Keine Internetverbindung – Online-Titel brauchen Internet.', 3500);
-    src = t.remote === 'server' ? withKey(encPath(t.streamUrl)) : t.remote === 'cloud' ? cloudSrc(t.streamUrl) : t.streamUrl;
-  } else {
-    let rec = null;
-    try { rec = await db.get('audio', id); } catch { /* */ }
-    if (token !== loadToken) return;
-    if (!rec) { toast('Audiodatei nicht gefunden.'); return; }
-    src = URL.createObjectURL(rec.blob);
+  clearTimeout(gapTimer); gapTimer = null;
+  if (t.remote && !autoplay) {
+    // Nicht schon beim App-Start Daten aus dem Netz laden
+    curId = id;
+    deferred = { startAt };
+    dropPrep();
+    for (const x of allEls) clearEl(x);
+    updatePlayerUI(); updateMediaSession(); markPlaying(); updatePlayState(); updateProgress();
+    return;
   }
-  if (audioUrl) URL.revokeObjectURL(audioUrl);
-  audioUrl = t.remote ? null : src;
+  if (isOnline(t) && !navigator.onLine) toast('Keine Internetverbindung – Online-Titel brauchen Internet.', 3500);
+  const we = wantsEq(id);
+  if (we) ensureEqGraph();
+  let el;
+  if (prep && prep.id === id && isEqEl(prep.el) === we && !prep.el.error) { el = prep.el; prep = null; }
+  else {
+    dropPrep();
+    const s = await sourceFor(t);
+    if (token !== loadToken) { if (s?.obj) URL.revokeObjectURL(s.obj); return; }
+    if (!s) { toast('Audiodatei nicht gefunden.'); return; }
+    const pair = we ? decks.eq : decks.plain;
+    el = pair.includes(audio) ? audio : pair[0]; // möglichst denselben Abspieler weiterverwenden (wichtig fürs iPhone)
+    setSrc(el, s);
+  }
+  for (const x of allEls) if (x !== el) clearEl(x);
+  cancelFade(el);
+  volFactor.delete(el);
+  applyVol(el);
   curId = id;
-  useElement(eq.on && !noCors.has(id) ? eqEl : plainEl);
-  audio.src = src;
-  if (startAt > 0) audio.addEventListener('loadedmetadata', () => { audio.currentTime = Math.min(startAt, (audio.duration || startAt + 1) - 0.5); }, { once: true });
+  audio = el;
+  if (startAt > 0) {
+    const seek = () => { el.currentTime = Math.min(startAt, (el.duration || startAt + 1) - 0.5); };
+    if (el.readyState >= 1) seek(); else el.addEventListener('loadedmetadata', seek, { once: true });
+  } else if (el.currentTime > 0) el.currentTime = 0;
   if (autoplay) {
-    if (audio === eqEl) eq.ctx?.resume();
-    audio.play().catch((e) => { if (e.name === 'NotAllowedError') updatePlayState(); });
-    if (counts) {
-      t.playCount = (t.playCount || 0) + 1;
-      t.lastPlayed = Date.now();
-      if (S.tracks.has(id)) { db.put('tracks', t); _albums = null; }
-      topUpSmart();
-    }
+    if (isEqEl(el)) eq.ctx?.resume();
+    el.play().catch((e) => { if (e.name === 'NotAllowedError') updatePlayState(); });
+    if (counts) onTrackStart(t);
   }
-  updatePlayerUI();
-  updateMediaSession();
-  markPlaying();
-  saveState();
-  if (overlays.includes('queue')) renderQueue();
+  lastPos = null;
+  afterTrackChange();
 }
 
 function togglePlay() {
@@ -629,7 +834,7 @@ function togglePlay() {
   }
   if (!curId) { loadAndPlay(true, 0); return; }
   if (deferred) { const d = deferred; deferred = null; loadAndPlay(true, d.startAt); return; }
-  if (audio.paused) { wantPlay = true; audio.play().catch(() => {}); } else audio.pause();
+  if (audio.paused) { wantPlay = true; if (isEqEl(audio)) eq.ctx?.resume(); audio.play().catch(() => {}); } else audio.pause();
 }
 
 function next(auto = false) {
@@ -648,6 +853,33 @@ function prev() {
   loadAndPlay(true);
 }
 
+// Zufall ohne Klumpen: derselbe Künstler kommt möglichst nicht direkt hintereinander
+const leadKey = (id) => { const t = getT(id); return nk(t?.artists?.[0] || t?.artist || ''); };
+function spreadShuffle(ids) {
+  const groups = new Map();
+  for (const id of shuffleArr(ids.slice())) {
+    const k = leadKey(id);
+    if (!groups.has(k)) groups.set(k, []);
+    groups.get(k).push(id);
+  }
+  // Jeder Künstler verteilt sich gleichmäßig über die Liste (mit etwas Zufall)
+  const placed = [];
+  for (const list of groups.values()) {
+    const n = list.length;
+    const off = Math.random() / n;
+    list.forEach((id, j) => placed.push([(j / n) + off + (Math.random() - 0.5) * (0.6 / n), id]));
+  }
+  const out = placed.sort((a, b) => a[0] - b[0]).map((x) => x[1]);
+  // Restliche direkte Wiederholungen auflösen
+  for (let i = 1; i < out.length; i++) {
+    if (leadKey(out[i]) !== leadKey(out[i - 1])) continue;
+    for (let j = i + 1; j < out.length; j++) {
+      if (leadKey(out[j]) !== leadKey(out[i - 1]) && (i + 1 >= out.length || leadKey(out[j]) !== leadKey(out[i + 1]))) { [out[i], out[j]] = [out[j], out[i]]; break; }
+    }
+  }
+  return out;
+}
+
 function playIds(rawIds, start = 0, opts = {}) {
   const ids = [];
   let startAt = 0;
@@ -659,7 +891,7 @@ function playIds(rawIds, start = 0, opts = {}) {
     const first = opts.shuffle ? Math.floor(Math.random() * ids.length) : startAt;
     const rest = ids.slice();
     const [f] = rest.splice(first, 1);
-    S.queue = [f, ...shuffleArr(rest)];
+    S.queue = [f, ...spreadShuffle(rest)];
     S.index = 0;
   } else {
     S.queue = ids.slice();
@@ -700,7 +932,7 @@ function toggleShuffle() {
     updateModeButtons();
     saveState();
     if (overlays.includes('queue')) renderQueue();
-    toast(S.recs.size ? 'Smart Shuffle an: passende Empfehlungen sind eingemischt' : 'Smart Shuffle an', 2200);
+    toast(S.recs.size ? 'Smart Shuffle an: passende Songs sind eingemischt' : 'Smart Shuffle an', 2400);
     return;
   }
   if (S.smart) { S.smart = false; removeRecsAhead(); }
@@ -711,7 +943,7 @@ function toggleShuffle() {
       S.original = S.queue.slice();
       const rest = S.queue.slice();
       rest.splice(S.index, 1);
-      S.queue = cur ? [cur, ...shuffleArr(rest)] : shuffleArr(rest);
+      S.queue = cur ? [cur, ...spreadShuffle(rest)] : spreadShuffle(rest);
       S.index = 0;
     } else {
       const i = S.original.indexOf(cur);
@@ -735,31 +967,30 @@ function stopPlayback() {
   curId = null;
   deferred = null;
   loadToken++;
-  audio.pause();
-  audio.removeAttribute('src');
-  audio.load();
-  if (audioUrl) { URL.revokeObjectURL(audioUrl); audioUrl = null; }
+  prep = null;
+  for (const x of allEls) clearEl(x);
   S.queue = []; S.original = []; S.index = -1;
   updatePlayerUI();
   markPlaying();
   saveState();
+  sendPresence();
 }
 
 function saveState() {
   ls.set('klang-player', {
     queue: S.queue, original: S.original, index: S.index,
-    time: curId ? audio.currentTime || 0 : 0,
+    time: curId ? (deferred ? deferred.startAt : audio.currentTime || 0) : 0,
     shuffle: S.shuffle, smart: S.smart, recs: [...S.recs].filter((id) => S.queue.includes(id)),
     repeat: S.repeat, source: S.source,
-    volume: audio.volume, muted: audio.muted,
+    volume: vol.level, muted: vol.muted,
     remote: [...new Set(S.queue)].filter((id) => !S.tracks.has(id) && remote.has(id)).slice(0, 400).map((id) => remote.get(id)),
+    saved: Date.now(),
   });
 }
 function restorePlayer() {
   const st = ls.get('klang-player', null);
   if (!st) return;
-  audio.volume = Number.isFinite(st.volume) ? st.volume : 1;
-  audio.muted = !!st.muted;
+  setVolume(Number.isFinite(st.volume) ? st.volume : 1, !!st.muted);
   S.shuffle = !!st.shuffle;
   S.smart = S.shuffle && !!st.smart;
   S.recs = new Set(Array.isArray(st.recs) ? st.recs : []);
@@ -775,26 +1006,21 @@ function restorePlayer() {
   updateVolumeUI();
   if (S.index >= 0) loadAndPlay(false, cur === S.queue[S.index] ? st.time || 0 : 0);
 }
+addEventListener('pagehide', () => saveState());
+document.addEventListener('visibilitychange', () => { if (document.hidden) saveState(); });
 
-// ---- Audio-Events (für beide Abspieler, wirken nur beim aktiven) ----
-function useElement(el) {
-  if (el === audio) return;
-  const old = audio;
-  el.volume = old.volume;
-  el.muted = old.muted;
-  old.pause();
-  old.removeAttribute('src');
-  old.load();
-  audio = el;
-  if (el === eqEl) ensureEqGraph();
-}
+// ---- Audio-Events (für alle Abspieler, wirken nur beim aktiven) ----
 function bindAudio(el) {
   const on = (type, fn) => el.addEventListener(type, (e) => { if (el === audio) fn(e); });
-  on('play', updatePlayState);
-  on('pause', () => { updatePlayState(); saveState(); });
-  on('playing', () => { errorStreak = 0; });
+  on('play', () => { updatePlayState(); sendPresence(); });
+  on('pause', () => { updatePlayState(); saveState(); sendPresence(); });
+  on('playing', () => { errorStreak = 0; lastPos = audio.currentTime; });
+  on('seeking', () => { lastPos = null; });
+  on('seeked', () => { lastPos = audio.currentTime; sendPresence(); });
   on('timeupdate', () => {
     updateProgress();
+    listenTick();
+    checkTransition();
     if (Date.now() - lastSave > 4000) { lastSave = Date.now(); saveState(); }
   });
   on('loadedmetadata', () => {
@@ -807,17 +1033,19 @@ function bindAudio(el) {
     updatePosState();
   });
   on('ended', () => {
-    if (S.sleep?.mode === 'end') { clearSleep(); toast('Sleep-Timer: Wiedergabe beendet'); return; }
+    if (S.sleep?.mode === 'end') { clearSleep(); toast('Sleep-Timer: Wiedergabe beendet'); sendPresence(); return; }
+    if (prep && advanceAuto(0)) return;
     next(true);
   });
   on('error', () => {
     if (!curId || !audio.getAttribute('src')) return;
     const t = getT(curId);
     // Quelle ohne CORS-Freigabe: ohne Equalizer nochmal versuchen
-    if (audio === eqEl && t?.remote && !noCors.has(t.id)) {
+    if (isEqEl(audio) && t?.remote && !noCors.has(t.id)) {
       noCors.add(t.id);
       toast('Bei dieser Quelle wirkt der Equalizer nicht. Sie läuft ohne.', 3500);
-      loadAndPlay(wantPlay, t.live ? 0 : eqEl.currentTime || 0);
+      reloadOnly = true;
+      loadAndPlay(wantPlay, t.live ? 0 : audio.currentTime || 0);
       return;
     }
     toast(t?.remote
@@ -825,13 +1053,28 @@ function bindAudio(el) {
       : `„${t?.title || 'Titel'}“ kann in diesem Browser nicht abgespielt werden.`, 4000);
     if (wantPlay && ++errorStreak < 3 && S.index < S.queue.length - 1) setTimeout(() => next(true), 800);
   });
-  on('volumechange', () => { updateVolumeUI(); });
 }
-bindAudio(plainEl);
-bindAudio(eqEl);
+allEls.forEach(bindAudio);
+
+// ---- Discord-Status: was gerade läuft (PC direkt, Handy über die private Cloud) ----
+let presTimer = null;
+function sendPresence() {
+  clearTimeout(presTimer);
+  presTimer = setTimeout(() => {
+    if (!PB.shareStatus) return;
+    const t = getT(curId);
+    const np = t && !t.live
+      ? { title: t.title + (t.version ? ` (${t.version})` : ''), artist: t.artist, album: t.album, dur: t.duration || audio.duration || 0, pos: audio.currentTime || 0, paused: audio.paused || !!deferred, device: isMobile() ? 'Handy' : 'PC' }
+      : { paused: true };
+    const body = JSON.stringify(np);
+    if (S.srvOK) fetch(withKey('/api/presence'), { method: 'POST', body, headers: { 'Content-Type': 'application/json' }, keepalive: true }).catch(() => {});
+    else { const c = cloudCfg(); if (c) fetch(`${c.url}/api/now?k=${encodeURIComponent(c.key)}`, { method: 'PUT', body, keepalive: true }).catch(() => {}); }
+  }, 700);
+}
+
 // Nur für automatische Tests am eigenen PC (nicht auf der Online-Version)
 if (/^(localhost|127\.0\.0\.1)$/.test(location.hostname)) {
-  window.__klangTest = { get audio() { return audio; }, get eq() { return eq; }, get S() { return S; }, getT };
+  window.__klangTest = { get audio() { return audio; }, get eq() { return eq; }, get S() { return S; }, getT, PB, get prep() { return prep; }, setVolume, stats };
 }
 
 /* =========================================================
@@ -863,7 +1106,7 @@ function ensureEqGraph() {
   const AC = window.AudioContext || window.webkitAudioContext;
   if (!AC) return;
   eq.ctx = new AC();
-  const src = eq.ctx.createMediaElementSource(eqEl);
+  const input = eq.ctx.createGain();
   eq.preGain = eq.ctx.createGain();
   eq.filters = EQ_FREQS.map((f, i) => {
     const b = eq.ctx.createBiquadFilter();
@@ -878,10 +1121,11 @@ function ensureEqGraph() {
   eq.analyser = eq.ctx.createAnalyser();
   eq.analyser.fftSize = 2048;
   eq.analyser.smoothingTimeConstant = 0.8;
-  let node = src.connect(eq.preGain);
+  let node = input.connect(eq.preGain);
   for (const f of eq.filters) node = node.connect(f);
   node.connect(limiter).connect(eq.analyser).connect(eq.ctx.destination);
-  eqEl.addEventListener('play', () => eq.ctx.resume());
+  // Beide Equalizer-Abspieler laufen durch dieselbe Kette (Überblenden geht auch mit Equalizer)
+  for (const el of decks.eq) { eq.ctx.createMediaElementSource(el).connect(input); el.addEventListener('play', () => eq.ctx.resume()); }
   applyEq();
 }
 function applyEq() {
@@ -898,8 +1142,7 @@ function setEqOn(on) {
   if (on) ensureEqGraph();
   const t = getT(curId);
   if (!t || deferred) return;
-  const wanted = on && !noCors.has(t.id) ? eqEl : plainEl;
-  if (wanted === audio) return;
+  if (wantsEq(t.id) === isEqEl(audio)) return;
   const wasPlaying = !audio.paused;
   reloadOnly = true; // gleicher Song, nur anderer Abspieler: nicht als neues Abspielen zählen
   loadAndPlay(wasPlaying, t.live ? 0 : audio.currentTime || 0);
@@ -1001,7 +1244,7 @@ function drawEqCurve() {
     g.lineWidth = 1;
     for (const db of [-12, -6, 0, 6, 12]) { const y = H / 2 - (db / 12) * (H / 2 - 16); g.beginPath(); g.moveTo(0, y); g.lineTo(W, y); g.stroke(); }
     // Spektrum (nur wenn Musik durch den Equalizer läuft)
-    if (spec && eq.on && audio === eqEl && !audio.paused) {
+    if (spec && eq.on && isEqEl(audio) && !audio.paused) {
       eq.analyser.getByteFrequencyData(spec);
       const ny = eq.ctx.sampleRate / 2;
       g.fillStyle = 'rgba(243,241,236,.10)';
@@ -1042,31 +1285,63 @@ const artistKeys = (t) => {
   if (t.title.includes(' - ')) parts.push(t.title.split(' - ')[0]);
   return [...new Set(parts.join(',').split(/\s*(?:,|&|\/|\bx\b|\bfeat\.?|\bft\.?|\bund\b)\s*/i).map((s) => s.trim().toLowerCase()).filter((s) => s.length > 1))];
 };
-function recommendFor(base, exclude) {
-  if (!base) return null;
-  const mine = new Set(artistKeys(base));
-  const now = Date.now();
-  let pool;
-  if (isOnline(base) && !base.live) {
-    pool = [...remote.values()].filter((t) => t.remote === 'audius');
-  } else {
-    pool = [...S.tracks.values()].filter((t) => !t.live);
+// Wer arbeitet mit wem? (aus allen Features der Bibliothek)
+let _collab = null;
+function collabGraph() {
+  if (_collab && _collab.size === S.tracks.size) return _collab.g;
+  const g = new Map();
+  for (const t of S.tracks.values()) {
+    const ks = artistsOf(t).map(artKey);
+    for (const a of ks) { if (!g.has(a)) g.set(a, new Map()); for (const b of ks) if (a !== b) g.get(a).set(b, (g.get(a).get(b) || 0) + 1); }
   }
+  _collab = { size: S.tracks.size, g };
+  return g;
+}
+// Wie gut passt Titel t hinter base? Schlau zwischen Künstlern wechseln statt immer derselbe
+function recommendFor(base, exclude, neighbors = []) {
+  if (!base) return null;
+  const now = Date.now();
+  if (isOnline(base) && !base.live) {
+    const mine = new Set(artistKeys(base));
+    const pool = [...remote.values()].filter((t) => t.remote === 'audius' && !exclude.has(t.id) && t.id !== base.id);
+    const scored = pool.map((t) => [artistKeys(t).filter((a) => mine.has(a)).length * 3 + (t.genre === base.genre ? 1.5 : 0) + Math.random() * 1.5, t.id]).filter((x) => x[0] > 1.6).sort((a, b) => b[0] - a[0]).slice(0, 8);
+    return scored.length ? scored[Math.floor(Math.random() * scored.length)][1] : null;
+  }
+  const g = collabGraph();
+  const baseKeys = artistsOf(base).map(artKey);
+  const lead = baseKeys[0];
+  const avoid = new Set(neighbors.map((id) => leadKey(id)).concat(lead));
+  // Nähe: direkte Partner zählen stark, Partner der Partner schwächer
+  const near = new Map();
+  for (const k of baseKeys) for (const [p, c] of g.get(k) || []) near.set(p, (near.get(p) || 0) + 2 + Math.min(3, c));
+  for (const [p] of g.get(lead) || []) for (const [q, c] of g.get(p) || []) if (!baseKeys.includes(q)) near.set(q, (near.get(q) || 0) + Math.min(1.5, c * 0.5));
+  // Geschmack: was hörst du viel?
+  const taste = stats.summary('month').artists;
+  const top = taste[0]?.sec || 1;
+  const like = new Map(taste.slice(0, 30).map((a) => [a.key, a.sec / top]));
+  const by = parseInt(base.year, 10) || 0;
+  const mix = PB.smartMix; // 'close' = nah am Song, 'balanced', 'wide' = mehr Abwechslung
   const scored = [];
-  for (const t of pool) {
-    if (exclude.has(t.id) || t.id === base.id) continue;
-    if (t.lastPlayed && now - t.lastPlayed < 2 * 3600e3) continue; // nicht gerade erst gehört
+  for (const t of S.tracks.values()) {
+    if (t.live || exclude.has(t.id) || t.id === base.id) continue;
+    if (t.lastPlayed && now - t.lastPlayed < 3 * 3600e3) continue; // nicht gerade erst gehört
+    if (/instrumental/i.test(t.version || '')) continue;
+    const ks = artistsOf(t).map(artKey);
     let s = 0;
-    for (const a of artistKeys(t)) if (mine.has(a)) s += 3;
-    if (albumKeyOf(t) === albumKeyOf(base)) s += 1;
-    if (t.genre && base.genre && t.genre.split(',')[0] === base.genre.split(',')[0]) s += 1.5;
-    if (t.fav) s += 1.5;
-    s += Math.random() * 1.5;
-    if (s > 1.6) scored.push([s, t.id]);
+    for (const k of ks) s += near.get(k) || 0;
+    if (ks.some((k) => baseKeys.includes(k))) s += mix === 'close' ? 3 : 1.5; // gleiche Crew
+    if (avoid.has(ks[0])) s -= mix === 'close' ? 2 : 6; // nicht derselbe Künstler direkt hintereinander
+    if (albumKeyOf(t) === albumKeyOf(base)) s -= 1.5;
+    const ty = parseInt(t.year, 10) || 0;
+    if (by && ty) s += Math.max(0, 1.5 - Math.abs(by - ty) * 0.3);
+    s += (like.get(ks[0]) || 0) * 2;
+    if (t.fav) s += 1.2;
+    s += Math.random() * (mix === 'wide' ? 4 : mix === 'close' ? 1 : 2.2);
+    if (s > 1) scored.push([s, t.id]);
   }
   scored.sort((a, b) => b[0] - a[0]);
-  const top = scored.slice(0, 8);
-  return top.length ? top[Math.floor(Math.random() * top.length)][1] : null;
+  const pick = scored.slice(0, mix === 'wide' ? 14 : 8);
+  return pick.length ? pick[Math.floor(Math.random() * pick.length)][1] : null;
 }
 // Hält die nächsten Songs gefüllt: nach je drei Songs eine Empfehlung
 const recAdded = new Set(); // Empfehlungen, die neu dazukamen (nicht nur nach vorne geholt)
@@ -1081,7 +1356,7 @@ function topUpSmart() {
     if (S.recs.has(S.queue[i])) { run = 0; continue; }
     run++;
     if (run === 3) {
-      const rec = recommendFor(getT(S.queue[i]) || getT(curId), near);
+      const rec = recommendFor(getT(S.queue[i]) || getT(curId), near, [S.queue[i], S.queue[i + 1]].filter(Boolean));
       if (!rec) break;
       const later = S.queue.indexOf(rec, i + 1);
       if (later > -1) S.queue.splice(later, 1); else recAdded.add(rec);
@@ -1164,11 +1439,11 @@ async function updatePlayerUI() {
   $('#player').classList.toggle('hidden', !t);
   document.body.classList.toggle('has-player', !!t);
   document.body.classList.toggle('is-live', !!t?.live);
-  if (!t) { document.title = 'Klang'; closeAllOverlays(); return; }
+  if (!t) { document.title = 'VERS'; closeAllOverlays(); return; }
   npEls.title.forEach((e) => { e.textContent = t.title; e.title = t.title; });
   npEls['artist-link'].forEach((e) => {
     e.textContent = t.live ? `Live-Radio · ${t.artist}` : t.artist;
-    e.href = t.live ? '#/radio' : t.artistId ? `#/oartist/${encodeURIComponent(t.artistId)}` : `#/artist/${encodeURIComponent(t.artist)}`;
+    e.href = t.live ? '#/radio' : t.artistId ? `#/oartist/${encodeURIComponent(t.artistId)}` : `#/artist/${encodeURIComponent(artistsOf(t)[0] || t.artist)}`;
   });
   npEls.cover.forEach((e) => {
     setCoverEl(e, t.coverId, t.album + t.artist);
@@ -1240,7 +1515,7 @@ function updateModeButtons() {
   npEls.repeat.forEach((e) => { e.classList.toggle('on', S.repeat !== 'off'); e.innerHTML = icon(S.repeat === 'one' ? 'repeat1' : 'repeat'); });
 }
 function updateVolumeUI() {
-  const v = audio.muted ? 0 : audio.volume;
+  const v = vol.muted ? 0 : vol.level;
   npEls.vol.forEach((r) => { r.value = Math.round(v * 100); r.style.setProperty('--p', v * 100 + '%'); });
   npEls['vol-icon'].forEach((e) => { e.innerHTML = icon(v === 0 ? 'mute' : v < 0.5 ? 'volume-low' : 'volume'); });
 }
@@ -1268,13 +1543,8 @@ function setSleep(mins) {
   updateSleepUI();
 }
 function fadeOutAndPause() {
-  const v0 = audio.volume;
-  let i = 0;
-  const iv = setInterval(() => {
-    i++;
-    audio.volume = Math.max(0, v0 * (1 - i / 30));
-    if (i >= 30) { clearInterval(iv); audio.pause(); audio.volume = v0; clearSleep(); }
-  }, 200);
+  const el = audio;
+  fade(el, 'out', 6, () => { el.pause(); volFactor.delete(el); applyVol(el); clearSleep(); });
 }
 function updateSleepUI() {
   let label = 'Sleep-Timer';
@@ -1339,14 +1609,25 @@ function renderLyrics(force = false) {
   if (!box || (!force && lyricsFor === curId)) return;
   lyricsFor = curId;
   lyricsIdx = -1;
-  lyricsParsed = t && !t.live ? parseLyrics(t.lyrics) : null;
+  const own = t && !t.live ? (t.lyrics || lyr.cachedText(t.id)) : '';
+  lyricsParsed = own ? parseLyrics(own) : null;
   if (!t) { box.innerHTML = ''; return; }
   if (t.live) { box.innerHTML = '<div class="ly-empty"><p>Beim Live-Radio gibt es keine Songtexte.</p></div>'; return; }
   if (!lyricsParsed) {
+    const instr = /instrumental/i.test(`${t.version || ''} ${t.title}`);
+    const tryNet = !instr && navigator.onLine && !lyr.isMiss(t.id);
+    if (tryNet) {
+      box.innerHTML = `<div class="ly-empty ly-loading"><span class="spinner"></span><p>Songtext wird geladen …</p></div>`;
+      const id = t.id;
+      lyr.get(t).then(() => { if (curId === id && lyricsFor === id) renderLyrics(true); }).catch(() => {});
+      lyricsFor = null; // nach dem Laden neu zeichnen
+      lyricsFor = id;
+      return;
+    }
     box.innerHTML = `<div class="ly-empty">
-      <p class="ly-empty-title">Kein Songtext gespeichert</p>
-      <p>Klang zeigt Songtexte aus deinen Dateien oder aus einer .lrc-Datei mit dem gleichen Namen wie der Song. Mit Zeitstempeln wie [01:23.45] laufen sie live mit.</p>
-      <div class="btns"><button class="btn btn-accent" data-action="lyrics-edit">${icon('edit')}Songtext einfügen</button><button class="btn" data-action="lyrics-file">${icon('upload')}.lrc-Datei laden</button></div>
+      <p class="ly-empty-title">${instr ? 'Instrumental' : navigator.onLine ? 'Kein Songtext gefunden' : 'Offline: Songtext noch nicht geladen'}</p>
+      <p>${instr ? 'Dieser Song hat keinen Gesang. Lehn dich zurück.' : 'Du kannst den Text selbst einfügen. Mit Zeitstempeln wie [01:23.45] läuft er live mit.'}</p>
+      ${instr ? '' : `<div class="btns"><button class="btn btn-accent" data-action="lyrics-edit">${icon('edit')}Songtext einfügen</button>${navigator.onLine ? `<button class="btn" data-action="lyrics-retry">${icon('refresh')}Nochmal suchen</button>` : ''}<button class="btn" data-action="lyrics-file">${icon('upload')}.lrc-Datei</button></div>`}
     </div>`;
     return;
   }
@@ -1354,7 +1635,7 @@ function renderLyrics(force = false) {
   box.innerHTML = `<div class="ly-lines ${synced ? 'synced' : ''}">${lines.map((l, i) => l.text
     ? `<p class="ly-line" data-i="${i}" ${synced ? `role="button" tabindex="0" data-t="${l.t}"` : ''}>${esc(l.text)}</p>`
     : `<p class="ly-gap" data-i="${i}" aria-hidden="true">${synced ? '♪' : ''}</p>`).join('')}</div>
-    <div class="ly-foot">${synced ? '' : '<span>Nicht synchronisiert · </span>'}<button class="link-sm" data-action="lyrics-edit">Bearbeiten</button></div>`;
+    <div class="ly-foot">${synced ? '' : '<span>Nicht synchronisiert · </span>'}${t.lyrics ? '' : '<span>Quelle: LRCLIB · </span>'}<button class="link-sm" data-action="lyrics-edit">Bearbeiten</button></div>`;
   box.scrollTop = 0;
   syncLyrics(true);
 }
@@ -1386,7 +1667,7 @@ async function editLyrics(id = curId) {
   if (!t || t.live) return;
   const r = await openDialog({
     title: 'Songtext',
-    body: `<label class="field"><span>Text oder LRC mit Zeitstempeln, z. B. [00:12.50] Erste Zeile</span><textarea name="text" rows="12" spellcheck="false" placeholder="[00:12.50] …">${esc(t.lyrics || '')}</textarea></label>`,
+    body: `<label class="field"><span>Text oder LRC mit Zeitstempeln, z. B. [00:12.50] Erste Zeile</span><textarea name="text" rows="12" spellcheck="false" placeholder="[00:12.50] …">${esc(t.lyrics || lyr.cachedText(t.id) || '')}</textarea></label>`,
     buttons: [{ label: 'Abbrechen' }, { label: 'Speichern', primary: true, value: 'ok' }],
   });
   if (!r) return;
@@ -1444,10 +1725,84 @@ function renderQueue() {
 }
 function qRow(t, qi, current = false) {
   return `<div class="row q-row ${current ? 'playing current' : ''}" data-qi="${qi}" data-id="${t.id}">
+    ${current ? '' : `<button class="q-handle" aria-label="Verschieben (Pfeiltasten)" title="Ziehen zum Verschieben">${icon('grip')}</button>`}
     ${coverHTML(t.coverId, t.album + t.artist, `row-cover ${t.live ? 'station-art' : ''}`, t.live ? 'radio' : 'music')}
     <div class="row-main"><div class="row-title">${eqHTML()}<span class="t">${esc(t.title)}</span></div><div class="row-sub">${S.recs.has(t.id) ? `<span class="rec-tag">${icon('sparkle')}Empfohlen</span> · ` : ''}${esc(t.artist)}</div></div>
     ${current ? '<span></span>' : `<button class="icon-btn row-more" data-action="q-remove" aria-label="Entfernen">${icon('x')}</button>`}
   </div>`;
+}
+// Verschieben in der Warteschlange (nur kommende Titel)
+function moveQueue(from, to) {
+  if (from === to || from <= S.index || to <= S.index || to >= S.queue.length) return;
+  const [id] = S.queue.splice(from, 1);
+  S.queue.splice(to, 0, id);
+  saveState();
+  renderQueue();
+  const h = $(`#queue-list .q-row[data-qi="${to}"] .q-handle`);
+  if (h && document.activeElement?.classList.contains('q-handle')) h.focus();
+}
+function setupQueueDrag() {
+  const list = $('#queue-list');
+  list.addEventListener('keydown', (e) => {
+    const h = e.target.closest('.q-handle');
+    if (!h || (e.key !== 'ArrowUp' && e.key !== 'ArrowDown')) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const qi = +h.closest('.q-row').dataset.qi;
+    moveQueue(qi, qi + (e.key === 'ArrowUp' ? -1 : 1));
+  });
+  list.addEventListener('pointerdown', (e) => {
+    const h = e.target.closest('.q-handle');
+    if (!h || e.button > 0) return;
+    e.preventDefault();
+    const row = h.closest('.q-row');
+    const rows = [...list.querySelectorAll('.q-row:not(.current)')];
+    const rects = rows.map((r) => r.getBoundingClientRect());
+    const idx = rows.indexOf(row);
+    const hgt = rects[idx].height;
+    const scroller = list.closest('#queue') ? list : list;
+    const st0 = scroller.scrollTop;
+    const y0 = e.clientY;
+    let to = idx, lastY = e.clientY, raf = 0;
+    try { h.setPointerCapture(e.pointerId); } catch { /* */ }
+    row.classList.add('dragging');
+    list.classList.add('sorting');
+    const layout = () => {
+      const dy = lastY - y0 + (scroller.scrollTop - st0);
+      row.style.transform = `translateY(${dy}px)`;
+      const cy = rects[idx].top + hgt / 2 + dy - (scroller.scrollTop - st0);
+      const absY = cy + (scroller.scrollTop - st0);
+      to = idx;
+      for (let i = 0; i < rects.length; i++) {
+        const mid = rects[i].top + rects[i].height / 2;
+        if (i < idx && absY < mid) { to = i; break; }
+        if (i > idx && absY > mid) to = i;
+      }
+      rows.forEach((r, i) => {
+        if (r === row) return;
+        const sh = idx < to && i > idx && i <= to ? -hgt : to < idx && i >= to && i < idx ? hgt : 0;
+        r.style.transform = sh ? `translateY(${sh}px)` : '';
+      });
+      // Am Rand automatisch scrollen
+      const b = scroller.getBoundingClientRect();
+      if (lastY < b.top + 50) scroller.scrollTop -= 8; else if (lastY > b.bottom - 50) scroller.scrollTop += 8;
+      if (lastY < b.top + 50 || lastY > b.bottom - 50) raf = requestAnimationFrame(layout); else raf = 0;
+    };
+    const move = (ev) => { lastY = ev.clientY; if (!raf) raf = requestAnimationFrame(layout); };
+    const up = () => {
+      cancelAnimationFrame(raf);
+      h.removeEventListener('pointermove', move);
+      h.removeEventListener('pointerup', up);
+      h.removeEventListener('pointercancel', up);
+      list.classList.remove('sorting');
+      rows.forEach((r) => { r.style.transform = ''; });
+      row.classList.remove('dragging');
+      if (to !== idx) moveQueue(+rows[idx].dataset.qi, +rows[to].dataset.qi);
+    };
+    h.addEventListener('pointermove', move);
+    h.addEventListener('pointerup', up);
+    h.addEventListener('pointercancel', up);
+  });
 }
 function removeFromQueue(qi) {
   if (qi === S.index) return;
@@ -1487,7 +1842,7 @@ function getDuration(blob) {
   });
 }
 
-// ZIP-Pakete (z. B. „für unterwegs“) auspacken. Unterstützt unkomprimierte ZIPs (so baut sie Klang);
+// ZIP-Pakete (z. B. „für unterwegs“) auspacken. Unterstützt unkomprimierte ZIPs (so baut sie VERS);
 // gelesen wird nur das Inhaltsverzeichnis, die Songs werden als Ausschnitte der Datei übernommen.
 const isZip = (f) => /\.zip$/i.test(f.name) || /zip/.test(f.type || '');
 async function unzipStored(file) {
@@ -1519,7 +1874,7 @@ async function unzipStored(file) {
     const name = new TextDecoder(flags & 0x0800 ? 'utf-8' : 'windows-1252').decode(nameBytes);
     p += 46 + nlen + xlen + clen;
     if (name.endsWith('/') || /(^|\/)(__MACOSX|\.)/.test(name)) continue;
-    if (method !== 0) { skipped++; continue; } // komprimierte Einträge kann Klang nicht auspacken
+    if (method !== 0) { skipped++; continue; } // komprimierte Einträge kann VERS nicht auspacken
     const lh = new DataView(await file.slice(lho, lho + 30).arrayBuffer());
     const start = lho + 30 + lh.getUint16(26, true) + lh.getUint16(28, true);
     const base = name.split('/').pop();
@@ -1539,7 +1894,7 @@ async function importItems(items) {
       try {
         const z = await unzipStored(x.file);
         expanded.push(...z.items);
-        if (z.skipped) toast(`${plural(z.skipped, 'Datei', 'Dateien')} im ZIP sind gepackt und wurden übersprungen. Klang-Pakete gehen immer.`, 5000);
+        if (z.skipped) toast(`${plural(z.skipped, 'Datei', 'Dateien')} im ZIP sind gepackt und wurden übersprungen. VERS-Pakete gehen immer.`, 5000);
       } catch { toast(`„${x.file.name}“ ist keine lesbare ZIP-Datei.`, 4000); }
     }
     items = expanded;
@@ -1728,6 +2083,7 @@ async function editTrack(id) {
   const d = r.data;
   t.title = d.title.trim() || t.title;
   t.artist = d.artist.trim() || 'Unbekannter Künstler';
+  t.artists = splitNames(t.artist);
   t.album = d.album.trim() || 'Unbekanntes Album';
   t.albumArtist = d.albumArtist.trim();
   t.trackNo = parseInt(d.trackNo, 10) || 0;
@@ -1934,8 +2290,9 @@ function trackMenu(id, anchor, ctx = {}) {
     if (t.artistId) items.push({ label: 'Zum Künstler', icon: 'user', fn: () => go('oartist', t.artistId) });
     if (t.permalink) items.push({ label: 'Auf Audius öffnen', icon: 'external', fn: () => window.open(t.permalink, '_blank', 'noopener') });
   } else {
+    const names = artistsOf(t);
     items.push({ label: 'Zum Album', icon: 'disc', fn: () => go('album', albumKeyOf(t)) },
-      { label: 'Zum Künstler', icon: 'user', fn: () => go('artist', t.artist) });
+      ...names.slice(0, 4).map((n) => ({ label: names.length > 1 ? `Zu ${n}` : 'Zum Künstler', icon: 'user', fn: () => go('artist', n) })));
   }
   if (ctx.playlist) {
     const p = S.playlists.find((x) => x.id === ctx.playlist);
@@ -2008,7 +2365,7 @@ function rowHTML(t, i, key, o) {
     : coverHTML(t.coverId, t.album + t.artist, 'row-cover');
   return `<div class="row" data-id="${t.id}" data-list="${key}" data-i="${i}"${o.playlist && finePointer() ? ' draggable="true"' : ''}>
     ${o.rank ? `<div class="row-rank ${i < 3 ? 'podium' : ''}">${i + 1}</div>` : ''}${lead}
-    <div class="row-main"><div class="row-title">${o.numbers ? '' : eqHTML()}<span class="t">${esc(t.title)}</span></div><div class="row-sub">${esc(t.artist)}</div></div>
+    <div class="row-main"><div class="row-title">${o.numbers ? '' : eqHTML()}<span class="t">${esc(t.title)}</span>${t.version ? `<span class="ver">${esc(t.version)}</span>` : ''}</div><div class="row-sub">${esc(o.artistCtx ? artistsOf(t).filter((n) => artKey(n) !== o.artistCtx).join(', ') || artistsOf(t)[0] : t.artist)}</div></div>
     <div class="row-album">${esc(isOnline(t) ? t.genre || 'Online' : t.album)}</div>
     <button class="icon-btn row-fav ${t.fav ? 'on' : ''}" data-action="fav" aria-label="Favorit">${icon(t.fav ? 'heart-fill' : 'heart')}</button>
     <div class="row-dur">${fmt(t.duration)}</div>
@@ -2078,7 +2435,7 @@ function albumCard(a) {
 }
 function artistCard(a) {
   return `<a class="card center" href="#/artist/${encodeURIComponent(a.name)}">
-    <div class="card-frame"><div class="card-art">${coverHTML(a.coverId, a.name, 'round')}<button class="card-play" data-action="play-artist" data-name="${esc(a.name)}" aria-label="${esc(a.name)} abspielen">${icon('play')}</button></div></div>
+    <div class="card-frame"><div class="card-art">${artistArt(a.name, a.coverId)}<button class="card-play" data-action="play-artist" data-name="${esc(a.name)}" aria-label="${esc(a.name)} abspielen">${icon('play')}</button></div></div>
     <div class="card-title">${esc(a.name)}</div>
     <div class="card-sub">${plural(a.tracks.length, 'Titel', 'Titel')}</div>
   </a>`;
@@ -2148,7 +2505,7 @@ function pageHead(title, sub = '', actions = '') {
   return `<header class="page-head"><div><h1>${title}</h1>${sub ? `<p class="muted">${sub}</p>` : ''}</div><div class="head-actions">${actions}</div></header>`;
 }
 function libTabs(active) {
-  return `<div class="chips m-only">${[['songs', 'Titel'], ['albums', 'Alben'], ['artists', 'Künstler'], ['favorites', 'Favoriten']]
+  return `<div class="chips m-only">${[['songs', 'Titel'], ['albums', 'Alben'], ['artists', 'Künstler'], ['favorites', 'Favoriten'], ['stats', 'Statistik']]
     .map(([k, l]) => `<a class="chip ${k === active ? 'on' : ''}" href="#/${k}">${l}</a>`).join('')}</div>`;
 }
 function discTabs(active) {
@@ -2164,7 +2521,7 @@ function emptyLib() {
     <h2>Deine Songs holen</h2>
     <p>Deine Musik liegt in deiner privaten Cloud. Diese Seite braucht einmal deinen Schlüssel, dann sind alle Songs da.</p>
     <ol class="steps">
-      <li>Am PC <b>Klang starten</b> (Klang starten.bat).</li>
+      <li>Am PC <b>VERS starten</b> (VERS starten.bat).</li>
       <li>Dort auf <b>„Aufs Handy“</b> klicken.</li>
       <li>Handy: QR-Code scannen. PC: <b>„Link kopieren“</b> drücken und hier einfügen.</li>
     </ol>
@@ -2385,32 +2742,153 @@ views.album = (key) => {
 views.artists = () => {
   S.lastLib = 'artists';
   if (!S.tracks.size) return libTabs('artists') + pageHead('Künstler') + emptyLib();
-  const arr = [...getArtists().values()].sort((a, b) => coll.compare(a.name, b.name));
-  return libTabs('artists') + pageHead('Künstler', plural(arr.length, 'Künstler', 'Künstler')) + `<div class="grid">${arr.map(artistCard).join('')}</div>`;
+  const all = [...getArtists().values()];
+  const main = all.filter(isMainArtist).sort((a, b) => coll.compare(a.name, b.name));
+  const guests = all.filter((a) => !isMainArtist(a)).sort((a, b) => b.tracks.length - a.tracks.length || coll.compare(a.name, b.name));
+  return libTabs('artists') + pageHead('Künstler', `${plural(main.length, 'Künstler', 'Künstler')}${guests.length ? ` · ${guests.length} Gäste` : ''}`)
+    + `<div class="grid">${main.map(artistCard).join('')}</div>`
+    + (guests.length ? section('Gäste &amp; Features', '', `<div class="artist-chips">${guests.map((a) => `<a class="chip" href="#/artist/${encodeURIComponent(a.name)}">${esc(a.name)} <small>${a.tracks.length}</small></a>`).join('')}</div>`) : '');
 };
 
+const artistSortOf = () => S.sort.artist || 'new';
+function artistTrackOrder(tracks, by) {
+  const listened = stats.trackSeconds();
+  const yr = (t) => parseInt(t.year, 10) || 0;
+  const arr = tracks.slice();
+  if (by === 'az') arr.sort((a, b) => coll.compare(a.title, b.title));
+  else if (by === 'top') arr.sort((a, b) => (listened.get(b.id) || 0) - (listened.get(a.id) || 0) || (b.playCount || 0) - (a.playCount || 0) || coll.compare(a.title, b.title));
+  else arr.sort((a, b) => yr(b) - yr(a) || coll.compare(a.album, b.album) || (a.discNo || 0) - (b.discNo || 0) || (a.trackNo || 0) - (b.trackNo || 0));
+  return arr.map((t) => t.id);
+}
 views.artist = (name) => {
-  const n = (name || '').toLowerCase();
-  const tracks = [...S.tracks.values()].filter((t) => t.artist.toLowerCase() === n || (t.albumArtist || '').toLowerCase() === n);
-  if (!tracks.length) return notFound();
-  const displayName = tracks.find((t) => t.artist.toLowerCase() === n)?.artist || tracks[0].albumArtist || name;
-  const albums = [...getAlbums().values()].filter((a) => a.artist.toLowerCase() === n || a.tracks.some((t) => t.artist.toLowerCase() === n))
-    .sort((a, b) => (parseInt(b.year, 10) || 0) - (parseInt(a.year, 10) || 0) || coll.compare(a.name, b.name));
-  const allIds = albums.flatMap((a) => a.tracks.filter((t) => tracks.includes(t)).map((t) => t.id));
-  const popular = tracks.slice().sort((a, b) => (b.playCount || 0) - (a.playCount || 0) || coll.compare(a.title, b.title)).slice(0, 5).map((t) => t.id);
-  const coverId = artistPicId(displayName) || tracks.find((t) => t.coverId)?.coverId;
-  const kAll = regList(allIds, { source: displayName });
-  const kPop = regList(popular, { source: displayName, noHead: true });
-  const dur = tracks.reduce((s, t) => s + (t.duration || 0), 0);
-  return `<div class="hero" style="--h:${hue(displayName)}" ${coverId ? `data-tint="${esc(coverId)}"` : ''}>
-      ${coverHTML(coverId, displayName, 'hero-art round')}
-      <div class="hero-info"><h1>${esc(displayName)}</h1>
-      <p>Künstler · ${plural(albums.length, 'Album', 'Alben')} · ${plural(tracks.length, 'Titel', 'Titel')}${dur >= 60 ? ' · ' + fmtLong(dur) : ''}</p></div>
+  const a = getArtists().get(artKey(name));
+  if (!a) return notFound();
+  const n = a.key;
+  const own = a.tracks.filter((t) => artKey(artistsOf(t)[0]) === n);
+  const feats = a.tracks.filter((t) => artKey(artistsOf(t)[0]) !== n);
+  const listened = stats.trackSeconds();
+  const popular = a.tracks.slice().sort((x, y) => (listened.get(y.id) || 0) - (listened.get(x.id) || 0) || (y.playCount || 0) - (x.playCount || 0) || (parseInt(y.year, 10) || 0) - (parseInt(x.year, 10) || 0)).slice(0, 5).map((t) => t.id);
+  const albums = [...getAlbums().values()].filter((al) => artKey(al.artist) === n || al.tracks.every((t) => artKey(artistsOf(t)[0]) === n))
+    .sort((x, y) => (parseInt(y.year, 10) || 0) - (parseInt(x.year, 10) || 0) || coll.compare(x.name, y.name));
+  const big = albums.filter((al) => al.tracks.length >= 4);
+  const singles = albums.filter((al) => al.tracks.length < 4);
+  const dur = a.tracks.reduce((s, t) => s + (t.duration || 0), 0);
+  const mine = stats.artistSeconds(a.name);
+  // Mit wem arbeitet der Künstler am meisten?
+  const peers = new Map();
+  for (const t of a.tracks) for (const o of artistsOf(t)) { const k = artKey(o); if (k !== n) peers.set(k, (peers.get(k) || 0) + 1); }
+  const peerList = [...peers].sort((x, y) => y[1] - x[1]).slice(0, 12).map(([k, c]) => [getArtists().get(k), c]).filter(([x]) => x);
+  const by = artistSortOf();
+  const kAll = regList(artistTrackOrder(a.tracks, by), { source: a.name });
+  const kPop = regList(popular, { source: a.name, noHead: true });
+  const kFeat = feats.length ? regList(artistTrackOrder(feats, 'new'), { source: `${a.name} · Features` }) : null;
+  const years = a.tracks.map((t) => parseInt(t.year, 10)).filter(Boolean);
+  const span = years.length ? (Math.min(...years) === Math.max(...years) ? `${Math.min(...years)}` : `${Math.min(...years)}–${Math.max(...years)}`) : '';
+  const facts = [
+    [own.length, own.length === 1 ? 'eigener Song' : 'eigene Songs'],
+    [feats.length, feats.length === 1 ? 'Feature' : 'Features'],
+    [big.length + singles.length, big.length + singles.length === 1 ? 'Release' : 'Releases'],
+    [fmtLong(dur), 'Spielzeit'],
+    ...(mine >= 60 ? [[fmtLong(mine), 'von dir gehört']] : []),
+  ];
+  return `<div class="hero artist-hero" style="--h:${hue(a.name)}" ${a.coverId ? `data-tint="${esc(a.coverId)}"` : ''}>
+      ${artistArt(a.name, a.coverId, 'hero-art')}
+      <div class="hero-info"><p class="eyebrow">Künstler${span ? ' · ' + span : ''}</p><h1>${esc(a.name)}</h1>
+      <dl class="facts">${facts.map(([v, l]) => `<div><dt>${esc(String(v))}</dt><dd>${l}</dd></div>`).join('')}</dl></div>
     </div>
-    <div class="actions-bar">${playButtons(kAll)}<button class="btn btn-ghost btn-sm pic-btn" data-action="artist-pic" data-name="${esc(displayName)}" aria-label="Künstlerbild ändern" title="Künstlerbild ändern">${icon('image')}<span>Bild ändern</span></button></div>
-    ${section('Beliebt', '', listEl(kPop, false))}
-    ${section('Alben', '', `<div class="grid">${albums.map(albumCard).join('')}</div>`)}
-    ${section('Alle Titel', '', listEl(kAll))}`;
+    <div class="actions-bar">${playButtons(kAll)}<button class="btn btn-ghost btn-sm pic-btn" data-action="artist-pic" data-name="${esc(a.name)}" aria-label="Künstlerbild ändern" title="Künstlerbild ändern">${icon('image')}<span>Bild ändern</span></button></div>
+    ${section(mine >= 60 ? 'Deine Favoriten von ' + esc(a.name) : 'Beliebt', '', listEl(kPop, false))}
+    ${big.length ? section('Alben', '', `<div class="shelf">${big.map(albumCard).join('')}</div>`) : ''}
+    ${singles.length ? section('Singles &amp; EPs', '', `<div class="shelf">${singles.map(albumCard).join('')}</div>`) : ''}
+    ${kFeat ? section(`Features <span class="muted sec-count">${feats.length}</span>`, '', listEl(kFeat)) : ''}
+    <section class="section"><div class="section-head"><h2>Alle Titel <span class="muted sec-count">${a.tracks.length}</span></h2>
+      <div class="chips seg" role="group" aria-label="Sortierung">${[['new', 'Neueste'], ['az', 'A–Z'], ['top', 'Meistgehört']].map(([k, l]) => `<button class="chip ${k === by ? 'on' : ''}" data-action="artist-sort" data-sort="${k}" aria-pressed="${k === by}">${l}</button>`).join('')}</div></div>
+      ${listEl(kAll)}</section>
+    ${peerList.length ? section('Oft zusammen mit', '', `<div class="peer-row">${peerList.map(([p, c]) => `<a class="peer" href="#/artist/${encodeURIComponent(p.name)}">${artistArt(p.name, p.coverId, 'peer-art')}<b>${esc(p.name)}</b><small>${plural(c, 'Song', 'Songs')}</small></a>`).join('')}</div>`) : ''}`;
+};
+
+/* ---------- Statistik: gehörte Minuten, Top-Künstler, Top-Songs ---------- */
+const STAT_RANGES = [['today', 'Heute'], ['week', '7 Tage'], ['month', '30 Tage'], ['year', '12 Monate'], ['all', 'Gesamt']];
+const minutes = (sec) => Math.round((sec || 0) / 60);
+const fmtMin = (sec) => { const m = minutes(sec); return m >= 600 ? `${(m / 60).toLocaleString('de', { maximumFractionDigits: 0 })} Std.` : `${m.toLocaleString('de')} Min.`; };
+function statBars(sum, range) {
+  // Ein Balken pro Tag (7/30 Tage) bzw. pro Monat (12 Monate/Gesamt)
+  const buckets = [];
+  if (range === 'week' || range === 'month') {
+    const n = range === 'week' ? 7 : 30;
+    for (let i = n - 1; i >= 0; i--) {
+      const d = new Date(Date.now() - i * 864e5);
+      const k = stats.dayKey(d);
+      buckets.push({ label: d.toLocaleDateString('de', range === 'week' ? { weekday: 'short' } : { day: 'numeric' }), full: d.toLocaleDateString('de', { weekday: 'long', day: 'numeric', month: 'long' }), sec: sum.days.get(k) || 0, tick: range === 'week' || i % 5 === 0 || i === 0 });
+    }
+  } else if (range === 'year' || range === 'all') {
+    const byMonth = new Map();
+    for (const [k, v] of sum.days) byMonth.set(k.slice(0, 7), (byMonth.get(k.slice(0, 7)) || 0) + v);
+    const now = new Date();
+    let months = 12;
+    if (range === 'all' && byMonth.size) {
+      const first = [...byMonth.keys()].sort()[0];
+      months = Math.max(1, (now.getFullYear() - +first.slice(0, 4)) * 12 + now.getMonth() - (+first.slice(5, 7) - 1) + 1);
+    }
+    for (let i = months - 1; i >= 0; i--) {
+      const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+      const k = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+      buckets.push({ label: d.toLocaleDateString('de', { month: 'short' }), full: d.toLocaleDateString('de', { month: 'long', year: 'numeric' }), sec: byMonth.get(k) || 0, tick: months <= 12 || i % 3 === 0 });
+    }
+  } else return '';
+  const max = Math.max(60, ...buckets.map((b) => b.sec));
+  const peak = buckets.reduce((a, b) => (b.sec > a.sec ? b : a), buckets[0]);
+  const avg = buckets.reduce((s, b) => s + b.sec, 0) / buckets.length;
+  return `<figure class="stat-chart" aria-label="Gehörte Minuten pro ${range === 'week' || range === 'month' ? 'Tag' : 'Monat'}">
+    <figcaption><span>Minuten pro ${range === 'week' || range === 'month' ? 'Tag' : 'Monat'}</span><small>Ø ${fmtMin(avg)} · Spitze ${esc(peak.full)}: ${fmtMin(peak.sec)}</small></figcaption>
+    <div class="bars" style="--n:${buckets.length}">
+      ${buckets.map((b) => `<div class="bar-col" tabindex="0" data-tip="${esc(b.full)}: ${fmtMin(b.sec)}"><div class="bar" style="--v:${(b.sec / max).toFixed(4)}"></div><span class="bar-x">${b.tick ? esc(b.label) : ''}</span></div>`).join('')}
+    </div>
+  </figure>`;
+}
+views.stats = () => {
+  S.lastLib = 'stats';
+  const range = S.statRange || 'month';
+  const sum = stats.summary(range);
+  const trackSec = new Map(sum.tracks.map((x) => [x.id, x]));
+  // Plays pro Künstler aus den gezählten Songs
+  const artPlays = new Map();
+  for (const x of sum.tracks) { const t = getT(x.id); if (!t) continue; for (const n of artistsOf(t)) { const k = artKey(n); artPlays.set(k, (artPlays.get(k) || 0) + x.plays); } }
+  const topA = sum.artists.slice(0, 10);
+  const maxA = topA[0]?.sec || 1;
+  const topT = sum.tracks.filter((x) => getT(x.id)).slice(0, 10);
+  const chips = `<div class="chips seg" role="group" aria-label="Zeitraum">${STAT_RANGES.map(([k, l]) => `<button class="chip ${k === range ? 'on' : ''}" data-action="stat-range" data-r="${k}" aria-pressed="${k === range}">${l}</button>`).join('')}</div>`;
+  const head = libTabs('stats') + pageHead('Statistik', 'Echte Hörzeit, gezählt während die Musik läuft') + chips;
+  if (sum.total < 30) {
+    return head + `<div class="empty stat-empty"><h2>${range === 'today' ? 'Heute noch nichts gehört' : 'Noch keine Hörzeit'}</h2><p>Sobald Musik läuft, zählt VERS jede Minute mit: insgesamt, pro Künstler und pro Song. Ein Song gilt als gespielt, wenn du mindestens 30 Sekunden oder die Hälfte gehört hast.</p><div class="btns"><button class="btn btn-accent" data-action="shuffle-all">${icon('shuffle')}Zufallsmix starten</button></div></div>`;
+  }
+  const tiles = [
+    [minutes(sum.total).toLocaleString('de'), 'Minuten gehört', sum.total >= 3600 ? `${(sum.total / 3600).toLocaleString('de', { maximumFractionDigits: 1 })} Stunden` : ''],
+    [sum.plays.toLocaleString('de'), sum.plays === 1 ? 'Song gespielt' : 'Songs gespielt', ''],
+    [sum.artists.length.toLocaleString('de'), 'Künstler', ''],
+    [stats.streak().toLocaleString('de'), 'Tage am Stück', 'mind. 1 Minute pro Tag'],
+  ];
+  const kTop = topT.length ? regList(topT.map((x) => x.id), { source: 'Deine Top-Songs', noHead: true, rank: true }) : null;
+  return head + `<div class="stat-tiles">${tiles.map(([v, l, sub], i) => `<div class="stat-tile ${i === 0 ? 'hero-tile' : ''}"><b>${v}</b><span>${l}</span>${sub ? `<small>${sub}</small>` : ''}</div>`).join('')}</div>
+    ${statBars(sum, range)}
+    <div class="stat-cols">
+      ${section('Top-Künstler', '', `<ol class="rank-list">${topA.map((a, i) => {
+        const real = getArtists().get(a.key);
+        const name = real?.name || a.name;
+        return `<li><a class="rank-row" href="#/artist/${encodeURIComponent(name)}">
+          <span class="rk ${i < 3 ? 'podium' : ''}">${i + 1}</span>${artistArt(name, real?.coverId || artistPicId(name), 'rank-art')}
+          <span class="rk-main"><b>${esc(name)}</b><span class="rk-bar"><i style="--v:${(a.sec / maxA).toFixed(4)}"></i></span></span>
+          <span class="rk-num"><b>${fmtMin(a.sec)}</b><small>${Math.round((a.sec / sum.total) * 100)} %${artPlays.get(a.key) ? ` · ${plural(artPlays.get(a.key), 'Play', 'Plays')}` : ''}</small></span></a></li>`;
+      }).join('')}</ol>`)}
+      ${kTop ? section('Top-Songs', '', `<div class="top-songs">${listEl(kTop, false)}</div><p class="muted stat-note">Sortiert nach gehörter Zeit · ${esc(STAT_RANGES.find((r) => r[0] === range)[1])}</p>`) : ''}
+    </div>
+    <p class="muted stat-note">Gezählt seit ${new Date(sum.since).toLocaleDateString('de', { day: 'numeric', month: 'long', year: 'numeric' })}. Die Statistik bleibt auf diesem Gerät.</p>`;
+};
+after.stats = () => {
+  // Minuten statt Länge in der Top-Songs-Liste
+  const sum = stats.summary(S.statRange || 'month');
+  const m = new Map(sum.tracks.map((x) => [x.id, x]));
+  $$('.top-songs .row').forEach((r) => { const x = m.get(r.dataset.id); const d = r.querySelector('.row-dur'); if (x && d) { d.textContent = fmtMin(x.sec); d.title = plural(x.plays, 'Play', 'Plays'); } });
 };
 
 views.favorites = () => {
@@ -2450,7 +2928,7 @@ views.playlist = (id) => {
     ${ids.length ? listEl(k) : `<div class="empty-small">Diese Playlist ist noch leer.<br>Füge Titel über das ⋯-Menü bei einem Song hinzu.</div>`}`;
 };
 
-views.search = () => `${pageHead('Suchen')}<div class="search-box">${icon('search')}<input id="search-input" type="search" placeholder="Songs, Künstler oder Radiosender" value="${esc(S.search)}" autocomplete="off" enterkeyhint="search"></div><div id="search-results"></div>`;
+views.search = () => `${pageHead('Suchen')}<div class="search-box">${icon('search')}<input id="search-input" type="search" placeholder="Song, Künstler, Album oder eine Zeile aus dem Text" value="${esc(S.search)}" autocomplete="off" enterkeyhint="search"></div><div id="search-results"></div>`;
 after.search = () => {
   const inp = $('#search-input');
   let tm;
@@ -2476,20 +2954,45 @@ function renderSearch() {
   }
   const terms = q.split(/\s+/);
   const match = (s) => terms.every((t) => s.includes(t));
-  const tracks = [...S.tracks.values()].filter((t) => match(searchStr(t)))
-    .sort((a, b) => (norm(b.title).startsWith(q) - norm(a.title).startsWith(q)) || (b.playCount || 0) - (a.playCount || 0) || coll.compare(a.title, b.title));
-  const albums = [...getAlbums().values()].filter((a) => match(norm(`${a.name} ${a.artist}`))).slice(0, 14);
-  const artists = [...getArtists().values()].filter((a) => match(norm(a.name))).slice(0, 14);
-  const hasLocal = tracks.length || albums.length || artists.length;
-  let html = '';
-  if (tracks.length) { const k = regList(tracks.slice(0, 100).map((t) => t.id), { source: `Suche: ${raw}` }); html += section(`In deiner Bibliothek <span class="muted" style="font-weight:500;font-size:15px">${tracks.length}</span>`, '', listEl(k)); }
-  if (artists.length) html += section('Deine Künstler', '', `<div class="shelf">${artists.map(artistCard).join('')}</div>`);
-  if (albums.length) html += section('Deine Alben', '', `<div class="shelf">${albums.map(albumCard).join('')}</div>`);
-  html += `<div id="search-online">${raw.length >= 2 ? loadingHTML('Suche online …') : ''}</div>`;
+  const f = S.searchFilter || 'all';
+  const want = (k) => f === 'all' || f === k;
+  const tracks = want('songs') ? [...S.tracks.values()].filter((t) => match(searchStr(t)))
+    .sort((a, b) => (norm(b.title).startsWith(q) - norm(a.title).startsWith(q)) || (b.playCount || 0) - (a.playCount || 0) || coll.compare(a.title, b.title)) : [];
+  const albums = want('albums') ? [...getAlbums().values()].filter((a) => match(norm(`${a.name} ${a.artist}`))).slice(0, f === 'albums' ? 60 : 14) : [];
+  const artists = want('artists') ? [...getArtists().values()].filter((a) => match(norm(a.name)))
+    .sort((a, b) => isMainArtist(b) - isMainArtist(a) || b.tracks.length - a.tracks.length).slice(0, f === 'artists' ? 60 : 14) : [];
+  // Textstellen: Songs, in deren Songtext die Suche vorkommt
+  const lterms = lyr.lnorm(raw).split(' ').filter((x) => x.length > 1);
+  const hits = [];
+  if (want('lyrics') && raw.length >= 3 && lterms.length) {
+    for (const t of S.tracks.values()) {
+      const line = lyr.matchLine(t.id, lterms);
+      if (line != null) hits.push([t, line]);
+      if (hits.length >= (f === 'lyrics' ? 80 : 12)) break;
+    }
+  }
+  const hasLocal = tracks.length || albums.length || artists.length || hits.length;
+  const chip = (k, l, n) => `<button class="chip ${k === f ? 'on' : ''}" data-action="search-filter" data-f="${k}" aria-pressed="${k === f}">${l}${n != null ? ` <small>${n}</small>` : ''}</button>`;
+  let html = `<div class="chips seg search-filter" role="group" aria-label="Filter">${chip('all', 'Alles')}${chip('songs', 'Songs')}${chip('artists', 'Künstler')}${chip('albums', 'Alben')}${chip('lyrics', 'Songtexte')}${chip('online', 'Online')}</div>`;
+  if (tracks.length) { const k = regList(tracks.slice(0, f === 'songs' ? 300 : 100).map((t) => t.id), { source: `Suche: ${raw}` }); html += section(`Songs <span class="muted sec-count">${tracks.length}</span>`, '', listEl(k)); }
+  if (artists.length) html += section('Künstler', '', `<div class="shelf">${artists.map(artistCard).join('')}</div>`);
+  if (hits.length) {
+    const k = regList(hits.map(([t]) => t.id), { source: `Songtext: ${raw}` });
+    const hl = (line) => { let h = esc(line); for (const t of terms) { const i = norm(line).indexOf(t); if (i >= 0 && t.length > 1) h = esc(line.slice(0, i)) + '<mark>' + esc(line.slice(i, i + t.length)) + '</mark>' + esc(line.slice(i + t.length)); break; } return h; };
+    html += section(`Im Songtext <span class="muted sec-count">${hits.length}</span>`, '', `<div class="lyric-hits">${hits.map(([t, line], i) => `<button class="lyric-hit" data-action="play-hit" data-list="${k}" data-i="${i}">${coverHTML(t.coverId, t.album + t.artist, 'row-cover')}<span class="lh-main"><b>${esc(t.title)}</b><small>${esc(t.artist)}</small><q>${hl(line)}</q></span></button>`).join('')}</div>`);
+  }
+  if (albums.length) html += section('Alben', '', `<div class="shelf">${albums.map(albumCard).join('')}</div>`);
+  if (want('lyrics') && !hits.length && f === 'lyrics') {
+    const c = lyr.counts([...S.tracks.values()]);
+    html += `<div class="empty-small">${raw.length < 3 ? 'Mindestens drei Buchstaben eingeben.' : `Keine Textstelle gefunden.`}<br><span class="muted">Durchsucht werden ${plural(c.have, 'geladener Songtext', 'geladene Songtexte')}.</span></div>`;
+  }
+  if (f !== 'all' && f !== 'online' && f !== 'lyrics' && !hasLocal) html += `<div class="empty-small">Keine Treffer für „${esc(raw)}“.</div>`;
+  const online = (f === 'all' || f === 'online') && raw.length >= 2;
+  html += `<div id="search-online">${online ? loadingHTML('Suche online …') : ''}</div>`;
   box.innerHTML = html;
   mountLists(box);
   hydrateCovers(box);
-  if (raw.length < 2) return;
+  if (!online) return;
   onlineSearchTimer = setTimeout(async () => {
     const el = $('#search-online');
     if (!el || token !== searchToken) return;
@@ -2515,96 +3018,203 @@ let onlineSearchTimer = null;
 let searchToken = 0;
 
 const ACCENTS = [
-  { name: 'Koralle', a: '#ff6b4a', b: '#e5397f', on: '#fff' },
-  { name: 'Violett', a: '#8b7bff', b: '#5b3fe0', on: '#fff' },
-  { name: 'Mint', a: '#2dd4a7', b: '#0ea5e9', on: '#06221b' },
-  { name: 'Pink', a: '#f472b6', b: '#a855f7', on: '#fff' },
-  { name: 'Blau', a: '#4f9dff', b: '#4f46e5', on: '#fff' },
-  { name: 'Gold', a: '#e9b44c', b: '#c98a2b', on: '#17120a' },
-  { name: 'Grün', a: '#4ade80', b: '#16a34a', on: '#052e12' },
+  { name: 'Gold', a: '#e9b44c' },
+  { name: 'Koralle', a: '#ff6b4a' },
+  { name: 'Rot', a: '#ff4d5e' },
+  { name: 'Pink', a: '#f472b6' },
+  { name: 'Violett', a: '#8b7bff' },
+  { name: 'Blau', a: '#4f9dff' },
+  { name: 'Türkis', a: '#2dd4bf' },
+  { name: 'Grün', a: '#4ade80' },
+  { name: 'Limette', a: '#c6f04a' },
+  { name: 'Weiß', a: '#ecebe6' },
 ];
-function applyAccent(name) {
-  const a = ACCENTS.find((x) => x.name === name) || ACCENTS.find((x) => x.name === 'Gold');
-  const r = document.documentElement.style;
-  r.setProperty('--accent', a.a);
-  r.setProperty('--accent-2', a.b);
-  r.setProperty('--on-accent', a.on);
+// Hintergründe: alle dunkel, damit Cover leuchten; Kontraste bleiben gleich
+const THEMES = [
+  { id: 'kino', name: 'Kino', c: ['#08080a', '#0c0c0f', '#131317', '#1b1b21', '#26262e', '#1f1f26', '#2f2f38'] },
+  { id: 'oled', name: 'OLED Schwarz', c: ['#000000', '#030303', '#0d0d0f', '#161618', '#212124', '#1a1a1d', '#2a2a2e'] },
+  { id: 'nacht', name: 'Mitternacht', c: ['#060a14', '#0a0f1c', '#101726', '#172034', '#212c45', '#1a2338', '#2a3654'] },
+  { id: 'graphit', name: 'Graphit', c: ['#121215', '#16161a', '#1d1d22', '#26262c', '#313139', '#2a2a31', '#3b3b45'] },
+  { id: 'aubergine', name: 'Aubergine', c: ['#0d0812', '#120b18', '#1a1122', '#23182e', '#2f223d', '#271b33', '#3a2b4a'] },
+  { id: 'wald', name: 'Wald', c: ['#060c0a', '#09110e', '#101a16', '#17241e', '#21322a', '#1a2720', '#29392f'] },
+  { id: 'espresso', name: 'Espresso', c: ['#0d0a08', '#120e0b', '#1a1511', '#241d18', '#302720', '#2a221c', '#3b3129'] },
+];
+const hexRgb = (h) => { const n = parseInt(h.slice(1), 16); return [n >> 16 & 255, n >> 8 & 255, n & 255]; };
+const rgbHex = (r, g, b) => '#' + [r, g, b].map((x) => Math.round(Math.max(0, Math.min(255, x))).toString(16).padStart(2, '0')).join('');
+const lum = (h) => { const c = hexRgb(h).map((v) => { v /= 255; return v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4; }); return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]; };
+const contrast = (a, b) => { const [x, y] = [lum(a), lum(b)].sort((p, q) => q - p); return (x + 0.05) / (y + 0.05); };
+const mixHex = (a, b, k) => { const p = hexRgb(a), q = hexRgb(b); return rgbHex(...p.map((v, i) => v + (q[i] - v) * k)); };
+// Akzent lesbar halten: auf dunklem Grund mindestens 4,5:1, sonst aufhellen
+function safeAccent(hex, bg) {
+  let a = /^#[0-9a-f]{6}$/i.test(hex) ? hex.toLowerCase() : '#e9b44c';
+  for (let i = 0; i < 20 && contrast(a, bg) < 4.5; i++) a = mixHex(a, '#ffffff', 0.12);
+  return a;
 }
+const curTheme = () => THEMES.find((t) => t.id === ls.get('klang-theme', 'kino')) || THEMES[0];
+function applyTheme() {
+  const t = curTheme();
+  const r = document.documentElement.style;
+  ['--bg', '--bg2', '--surface', '--surface2', '--surface3', '--line', '--line2'].forEach((k, i) => r.setProperty(k, t.c[i]));
+  document.querySelector('meta[name="theme-color"]')?.setAttribute('content', t.c[0]);
+  applyAccent(ls.get('klang-accent', 'Gold'));
+}
+function applyAccent(name) {
+  const preset = ACCENTS.find((x) => x.name === name);
+  const raw = preset ? preset.a : /^#[0-9a-f]{6}$/i.test(name || '') ? name : '#e9b44c';
+  const bg = curTheme().c[0];
+  const a = safeAccent(raw, bg);
+  const r = document.documentElement.style;
+  r.setProperty('--accent', a);
+  r.setProperty('--accent-2', mixHex(a, '#000000', 0.18));
+  r.setProperty('--on-accent', contrast(a, '#111111') >= contrast(a, '#ffffff') ? '#111111' : '#ffffff');
+  return a !== raw.toLowerCase();
+}
+function setMotion(mode) {
+  ls.set('klang-motion', mode);
+  document.documentElement.classList.toggle('calm', mode === 'calm');
+}
+
+const setRow = (label, sub, control) => `<div class="set-row"><div class="lbl">${label}${sub ? `<small>${sub}</small>` : ''}</div>${control}</div>`;
+const toggleBtn = (action, on, extra = '') => `<button class="switch ${on ? 'on' : ''}" role="switch" aria-checked="${on}" data-action="${action}" ${extra}><span>${on ? 'An' : 'Aus'}</span></button>`;
+const segBtns = (action, cur, opts) => `<div class="chips seg" role="group">${opts.map(([v, l]) => `<button class="chip ${String(v) === String(cur) ? 'on' : ''}" data-action="${action}" data-v="${v}" aria-pressed="${String(v) === String(cur)}">${l}</button>`).join('')}</div>`;
+const onPC = () => /^(localhost|127\.0\.0\.1|\[::1\])$/.test(location.hostname);
 
 views.settings = () => {
   const tracks = [...S.tracks.values()];
-  const size = tracks.reduce((s, t) => s + (t.size || 0), 0);
+  const size = tracks.filter((t) => !t.remote).reduce((s, t) => s + (t.size || 0), 0);
   const accent = ls.get('klang-accent', 'Gold');
+  const custom = !ACCENTS.some((a) => a.name === accent);
   const folder = finePointer() && 'webkitdirectory' in document.createElement('input');
   const ios = /iphone|ipad|ipod/i.test(navigator.userAgent);
   const standalone = matchMedia('(display-mode: standalone)').matches || navigator.standalone;
-  return pageHead('Einstellungen') + `<div class="settings">
-    <div class="set-card">
-      <h2>Bibliothek</h2>
-      <p>${plural(tracks.length, 'Titel', 'Titel')} · ${plural(getAlbums().size, 'Album', 'Alben')} · ${plural(S.playlists.length, 'Playlist', 'Playlists')} · ${fmtBytes(size)}</p>
-      <div class="btn-row">
-        <button class="btn btn-accent" data-action="import-files">${icon('upload')}Dateien hinzufügen</button>
-        ${folder ? `<button class="btn" data-action="import-folder">${icon('folder')}Ordner hinzufügen</button>` : ''}
-      </div>
-    </div>
-    ${S.srvOK && /^(localhost|127\.0\.0\.1|\[::1\])$/.test(location.hostname) ? `<div class="set-card">
-      <h2>Aufs Handy</h2>
-      <p>Deine Songs am Handy hören: QR-Code scannen, fertig. Mit der Cloud geht das überall, auch ohne PC.</p>
-      <button class="btn btn-accent" data-action="phone-connect">${icon('phone')}QR-Code zeigen</button>
-    </div>` : ''}
-    ${cloudCfg() && !S.srvOK ? `<div class="set-card">
-      <h2>Cloud</h2>
-      <p>Verbunden mit deinem privaten Cloud-Speicher: ${plural([...S.tracks.values()].filter((t) => t.remote === 'cloud').length, 'Song', 'Songs')}. Läuft überall mit Internet.</p>
-      <div class="btn-row">
-        <button class="btn btn-accent" data-action="cloud-reload">${icon('refresh')}Neu laden</button>
-        <button class="btn btn-danger" data-action="cloud-off">Trennen</button>
-      </div>
-    </div>` : ''}
-    <div class="set-card">
-      <h2>Speicher</h2>
-      <p>Deine Musik liegt nur auf diesem Gerät, im Speicher des Browsers bzw. der App.</p>
-      <div id="storage-info" class="muted" style="font-size:14px">Wird berechnet …</div>
-    </div>
-    <div class="set-card">
-      <h2>Farbe &amp; Live-Cover</h2>
-      <p>Die Farbe gilt für Play-Knöpfe, Fortschritt und den Score-Bug im Player.</p>
-      <div class="swatches">${ACCENTS.map((a) => `<button class="swatch ${a.name === accent ? 'on' : ''}" data-action="accent" data-name="${a.name}" title="${a.name}" aria-label="${a.name}" style="background:${a.a}"></button>`).join('')}</div>
-      <div class="set-row" style="margin-top:14px;border-top:1px solid var(--line)"><div class="lbl">Live-Cover<small>Bewegtes Cover-Bild hinter dem Vollbild-Player</small></div><button class="btn btn-sm" data-action="toggle-live">${liveCoverOn() ? 'An' : 'Aus'}</button></div>
-    </div>
-    <div class="set-card">
-      <h2>App installieren</h2>
-      ${standalone ? '<p>Klang läuft bereits als installierte App. 🎉</p>'
-        : ios ? '<p>Tippe in Safari unten auf <b>Teilen</b> und dann auf <b>„Zum Home-Bildschirm“</b>. Danach startet Klang wie eine normale App, im Vollbild und offline.</p>'
-          : `<p>Installiere Klang als eigene App mit Icon auf dem Startbildschirm bzw. im Startmenü. Danach funktioniert sie auch offline.</p>
-             <button class="btn ${deferredInstall ? 'btn-accent' : 'hidden'}" data-action="install" data-install>${icon('download')}Jetzt installieren</button>
-             ${deferredInstall ? '' : '<p class="muted" style="font-size:13px;margin:0">Falls kein Knopf erscheint: im Browser-Menü (⋮) auf <b>„App installieren“</b> bzw. <b>„Zum Startbildschirm hinzufügen“</b> tippen.</p>'}`}
-    </div>
-    ${finePointer() ? `<div class="set-card">
-      <h2>Tastenkürzel</h2>
-      <div class="kbd-list" style="margin-top:12px">
+  const lc = lyr.counts(tracks.filter((t) => !t.live));
+  const motion = ls.get('klang-motion', 'full');
+  const nav = [['play', 'Wiedergabe'], ['look', 'Aussehen'], ['lib', 'Bibliothek'], ['offline', 'Offline'], ['discord', 'Discord'], ['data', 'Daten']];
+  return pageHead('Einstellungen') + `<nav class="set-nav chips" aria-label="Bereiche">${nav.map(([k, l]) => `<a class="chip" href="#set-${k}" data-action="set-jump" data-k="${k}">${l}</a>`).join('')}</nav>
+  <div class="settings">
+    <div class="set-card" id="set-play">
+      <h2>Wiedergabe</h2>
+      ${setRow('Überblenden', decksOK() ? 'Songs gehen sanft ineinander über' : 'Auf iPhone/iPad nicht möglich (Apple erlaubt keine zwei Abspieler gleichzeitig)', decksOK() ? `<div class="xf"><input type="range" class="range" min="0" max="12" step="1" value="${PB.xfade}" data-xfade aria-label="Überblenden in Sekunden" style="--p:${PB.xfade / 12 * 100}%"><output data-xfade-out>${PB.xfade ? PB.xfade + ' s' : 'Aus'}</output></div>` : '<span class="muted">–</span>')}
+      ${setRow('Lückenlos', 'Lädt den nächsten Song vorab, damit keine Pause entsteht', toggleBtn('pb-gapless', PB.gapless && decksOK(), decksOK() ? '' : 'disabled'))}
+      ${setRow('Smart Shuffle', 'Wie weit sich die Empfehlungen vom aktuellen Song entfernen', segBtns('pb-mix', PB.smartMix, [['close', 'Nah dran'], ['balanced', 'Ausgewogen'], ['wide', 'Abwechslung']]))}
+      ${setRow('Equalizer', '10 Bänder, Voreinstellungen, Begrenzer', `<button class="btn btn-sm" data-action="eq">${icon('equalizer')}Öffnen</button>`)}
+      ${finePointer() ? `<details class="kbd"><summary>Tastenkürzel</summary><div class="kbd-list">
         <kbd>Leertaste</kbd><span>Abspielen / Pause</span>
         <kbd>← →</kbd><span>5 Sekunden zurück / vor</span>
         <kbd>Shift + ← →</kbd><span>Vorheriger / nächster Titel</span>
         <kbd>↑ ↓</kbd><span>Lautstärke</span>
         <kbd>M</kbd><span>Stumm</span>
-        <kbd>S</kbd><span>Zufallswiedergabe</span>
+        <kbd>S</kbd><span>Zufall / Smart Shuffle</span>
         <kbd>R</kbd><span>Wiederholen</span>
         <kbd>L</kbd><span>Aktuellen Titel als Favorit</span>
         <kbd>Q</kbd><span>Warteschlange</span>
         <kbd>T</kbd><span>Songtext ein/aus</span>
         <kbd>E</kbd><span>Equalizer</span>
         <kbd>Strg + K</kbd><span>Suchen</span>
+        <kbd>Medientasten</kbd><span>Tastatur, Kopfhörer und Sperrbildschirm</span>
+      </div></details>` : ''}
+    </div>
+
+    <div class="set-card" id="set-look">
+      <h2>Aussehen</h2>
+      <p>Akzentfarbe für Play, Fortschritt und Auswahl. Zu dunkle Farben hellt VERS automatisch auf, damit alles lesbar bleibt.</p>
+      <div class="swatches">${ACCENTS.map((a) => `<button class="swatch ${a.name === accent ? 'on' : ''}" data-action="accent" data-name="${a.name}" title="${a.name}" aria-label="${a.name}" style="background:${a.a}"></button>`).join('')}
+        <label class="swatch custom ${custom ? 'on' : ''}" title="Eigene Farbe" style="${custom ? `background:${esc(accent)}` : ''}"><input type="color" data-custom-accent value="${custom ? esc(accent) : '#e9b44c'}" aria-label="Eigene Farbe wählen">${icon('plus')}</label></div>
+      <h3>Hintergrund</h3>
+      <div class="themes">${THEMES.map((t) => `<button class="theme ${t.id === curTheme().id ? 'on' : ''}" data-action="theme" data-id="${t.id}" aria-pressed="${t.id === curTheme().id}"><span class="theme-prev" style="--b:${t.c[0]};--s:${t.c[3]};--l:${t.c[6]}"><i></i><i></i><i></i></span><span>${t.name}</span></button>`).join('')}</div>
+      ${setRow('Live-Cover', 'Bewegtes Cover hinter dem Vollbild-Player', toggleBtn('toggle-live', liveCoverOn()))}
+      ${setRow('Animationen', 'Ruhig: keine Bewegung beim Seitenwechsel, schont auch den Akku', segBtns('motion', motion, [['full', 'Voll'], ['calm', 'Ruhig']]))}
+    </div>
+
+    <div class="set-card" id="set-lib">
+      <h2>Bibliothek</h2>
+      <p>${plural(tracks.length, 'Titel', 'Titel')} · ${plural(getAlbums().size, 'Release', 'Releases')} · ${plural([...getArtists().values()].filter(isMainArtist).length, 'Künstler', 'Künstler')} · ${plural(S.playlists.length, 'Playlist', 'Playlists')}</p>
+      <div class="btn-row">
+        <button class="btn btn-accent" data-action="import-files">${icon('upload')}Dateien hinzufügen</button>
+        ${folder ? `<button class="btn" data-action="import-folder">${icon('folder')}Ordner hinzufügen</button>` : ''}
+        ${S.srvOK ? `<button class="btn" data-action="reload-server-lib">${icon('refresh')}Musik-Ordner neu laden</button>` : ''}
+      </div>
+    </div>
+    ${S.srvOK && onPC() ? `<div class="set-card">
+      <h2>Aufs Handy</h2>
+      <p>Deine Songs am Handy: QR-Code scannen, fertig. Mit der Cloud geht das überall, auch ohne PC.</p>
+      <button class="btn btn-accent" data-action="phone-connect">${icon('phone')}QR-Code zeigen</button>
+    </div>` : ''}
+    ${cloudCfg() && !S.srvOK ? `<div class="set-card">
+      <h2>Cloud</h2>
+      <p>Verbunden mit deinem privaten Cloud-Speicher: ${plural(tracks.filter((t) => t.remote === 'cloud').length, 'Song', 'Songs')}. Läuft überall mit Internet.</p>
+      <div class="btn-row">
+        <button class="btn btn-accent" data-action="cloud-reload">${icon('refresh')}Neu laden</button>
+        <button class="btn btn-danger" data-action="cloud-off">Trennen</button>
       </div>
     </div>` : ''}
-    <div class="set-card">
-      <h2>Gefahrenzone</h2>
-      <p>Entfernt alle Titel, Cover und Playlists von diesem Gerät. Deine Originaldateien bleiben unberührt.</p>
-      <button class="btn btn-danger" data-action="wipe" ${tracks.length || S.playlists.length ? '' : 'disabled'}>${icon('trash')}Bibliothek komplett löschen</button>
+
+    <div class="set-card" id="set-offline">
+      <h2>Offline &amp; Songtexte</h2>
+      ${setRow('Songtexte', `${plural(lc.have, 'Songtext', 'Songtexte')} gespeichert${lc.open ? ` · ${lc.open} noch offen` : ''}${lc.miss ? ` · ${lc.miss} ohne Text` : ''}`, `<button class="btn btn-sm" data-action="lyrics-all" ${lc.open && navigator.onLine ? '' : 'disabled'}>${icon('download')}<span data-lyrics-progress>${lc.open ? 'Alle laden' : 'Vollständig'}</span></button>`)}
+      ${setRow('Cover', 'Werden beim ersten Anzeigen gespeichert und gehen danach offline', `<button class="btn btn-sm" data-action="covers-all">${icon('download')}<span data-cover-progress>Alle laden</span></button>`)}
+      <div id="storage-info" class="muted" style="font-size:14px;margin-top:10px">Wird berechnet …</div>
+      ${size ? `<p class="muted small">Davon importierte Musik: ${fmtBytes(size)}</p>` : ''}
     </div>
-    <p class="muted" style="font-size:12.5px;text-align:center">Klang 1.0 · Deine Musik bleibt bei dir.</p>
+
+    <div class="set-card" id="set-discord">
+      <h2>Discord</h2>
+      <p>Zeigt auf Discord „Hört VERS“ mit Song, Künstler, Cover und Restzeit.</p>
+      ${setRow('Status teilen', 'Was du hörst, an deinen Discord-Status senden', toggleBtn('pb-share', PB.shareStatus))}
+      ${onPC() && S.srvOK ? `<div id="discord-box" class="discord-box">${loadingHTML('Prüfe Discord …')}</div>` : `<p class="muted small">${isMobile() || ios ? 'Am Handy kann keine App direkt mit Discord reden. VERS schickt den Song deshalb über deine Cloud an den PC, und der PC setzt den Status. Dafür muss VERS am PC laufen und Discord am PC offen sein.' : 'Der Discord-Status wird am PC eingerichtet: VERS über „VERS starten.bat“ öffnen, dann hier Discord einschalten.'}</p>`}
+    </div>
+
+    <div class="set-card">
+      <h2>App installieren</h2>
+      ${standalone ? '<p>VERS läuft bereits als installierte App.</p>'
+        : ios ? '<p>Tippe in Safari unten auf <b>Teilen</b> und dann auf <b>„Zum Home-Bildschirm“</b>. Danach startet VERS wie eine normale App, im Vollbild und offline.</p>'
+          : `<p>Installiere VERS als eigene App mit Icon auf dem Startbildschirm bzw. im Startmenü. Danach funktioniert sie auch offline.</p>
+             <button class="btn ${deferredInstall ? 'btn-accent' : 'hidden'}" data-action="install" data-install>${icon('download')}Jetzt installieren</button>
+             ${deferredInstall ? '' : '<p class="muted" style="font-size:13px;margin:0">Falls kein Knopf erscheint: im Browser-Menü (⋮) auf <b>„App installieren“</b> bzw. <b>„Zum Startbildschirm hinzufügen“</b> tippen.</p>'}`}
+    </div>
+
+    <div class="set-card" id="set-data">
+      <h2>Daten</h2>
+      ${setRow('Hörstatistik', `Seit ${new Date(stats.summary('all').since).toLocaleDateString('de')} · ${fmtMin(stats.summary('all').total)}`, `<div class="btn-row"><button class="btn btn-sm" data-action="stats-export">${icon('download')}Sichern</button><button class="btn btn-sm btn-danger" data-action="stats-reset">Zurücksetzen</button></div>`)}
+      ${setRow('Gespeicherte Songtexte', 'Werden bei Bedarf neu geladen', `<button class="btn btn-sm" data-action="lyrics-clear">Löschen</button>`)}
+      ${setRow('Bibliothek löschen', 'Entfernt Titel, Cover und Playlists von diesem Gerät. Deine Originaldateien bleiben.', `<button class="btn btn-sm btn-danger" data-action="wipe" ${tracks.length || S.playlists.length ? '' : 'disabled'}>${icon('trash')}Löschen</button>`)}
+    </div>
+    <p class="muted" style="font-size:12.5px;text-align:center">VERS 2.0 · Deine Musik bleibt bei dir.</p>
   </div>`;
 };
+async function renderDiscordBox() {
+  const box = $('#discord-box');
+  if (!box) return;
+  let info = null;
+  try { const r = await fetch('/api/discord', { cache: 'no-store' }); if (r.ok) info = await r.json(); } catch { /* */ }
+  if (!box.isConnected) return;
+  if (!info) { box.innerHTML = '<p class="muted small">Der VERS-Server am PC ist zu alt. Bitte VERS einmal neu starten.</p>'; return; }
+  const ok = info.status === 'verbunden';
+  box.innerHTML = `${setRow('Am PC verbinden', info.enabled ? `Status: <b class="${ok ? 'ok' : ''}">${esc(info.status)}</b>` : 'Braucht die Discord-App auf diesem PC', toggleBtn('discord-toggle', info.enabled))}
+    <label class="field"><span>Application-ID (einmalig, siehe Anleitung)</span><input data-discord-id inputmode="numeric" placeholder="z. B. 1234567890123456789" value="${esc(info.clientId)}" autocomplete="off"></label>
+    <details class="small"><summary>So bekommst du die Application-ID (2 Minuten)</summary><ol class="steps">
+      <li><a class="link" href="https://discord.com/developers/applications" target="_blank" rel="noopener">discord.com/developers/applications</a> öffnen und mit deinem Discord-Konto anmelden.</li>
+      <li><b>New Application</b> → Name <b>VERS</b> → erstellen. Dieser Name steht später in „Hört VERS“.</li>
+      <li>Optional unter <b>App Icon</b> das VERS-Logo hochladen (liegt im Ordner <code>icons</code>).</li>
+      <li>Die <b>Application ID</b> kopieren und oben einfügen, dann „Am PC verbinden“ einschalten.</li>
+    </ol></details>`;
+}
+
 after.settings = async () => {
+  renderDiscordBox();
+  const xf = $('[data-xfade]');
+  xf?.addEventListener('input', () => {
+    PB.xfade = +xf.value;
+    savePB();
+    xf.style.setProperty('--p', PB.xfade / 12 * 100 + '%');
+    $('[data-xfade-out]').textContent = PB.xfade ? PB.xfade + ' s' : 'Aus';
+  });
+  const ca = $('[data-custom-accent]');
+  ca?.addEventListener('input', () => { ls.set('klang-accent', ca.value); applyAccent(ca.value); ca.parentElement.style.background = ca.value; });
+  ca?.addEventListener('change', () => {
+    if (applyAccent(ca.value)) toast('Etwas aufgehellt, damit Text und Knöpfe lesbar bleiben.', 2600);
+    $$('.swatch').forEach((s) => s.classList.toggle('on', s === ca.parentElement));
+  });
   const el = $('#storage-info');
   if (!el) return;
   let html = '';
@@ -2625,7 +3235,9 @@ after.settings = async () => {
 /* =========================================================
    Kino-Bewegung: GSAP, Lenis, View Transitions
    ========================================================= */
-const reducedMotion = () => matchMedia('(prefers-reduced-motion: reduce)').matches;
+const reducedMotion = () => matchMedia('(prefers-reduced-motion: reduce)').matches || ls.get('klang-motion', 'full') === 'calm';
+function setSwitch(el, on) { el.classList.toggle('on', on); el.setAttribute('aria-checked', String(on)); const sp = el.querySelector('span'); if (sp) sp.textContent = on ? 'An' : 'Aus'; }
+function segSelect(el) { el.parentElement.querySelectorAll('.chip').forEach((c) => { const on = c === el; c.classList.toggle('on', on); c.setAttribute('aria-pressed', String(on)); }); }
 const motionOK = () => !reducedMotion() && !!window.gsap;
 let lenis = null;
 function setupMotion() {
@@ -2668,7 +3280,7 @@ const feat = { ids: [], k: null, i: 0, timer: 0, paused: false, hover: false, se
 const featureSkeleton = () => `<div class="ft-slide ft-skel"><div class="ft-body"><div class="ft-copy"><span class="sk sk-t"></span><span class="sk sk-t2"></span><span class="sk sk-m"></span></div><div class="ft-art"><div class="cover"></div></div></div></div>`;
 function featureOffline(msg) {
   const stage = $('#feature .ft-stage');
-  if (stage) stage.innerHTML = `<div class="ft-slide"><div class="ft-body"><div class="ft-copy"><h1 class="ft-title">Klang</h1><p class="ft-meta">${esc(msg || (navigator.onLine ? 'Der Online-Katalog ist gerade nicht erreichbar.' : 'Offline: deine eigene Musik läuft trotzdem.'))}</p></div></div></div>`;
+  if (stage) stage.innerHTML = `<div class="ft-slide"><div class="ft-body"><div class="ft-copy"><h1 class="ft-title">VERS</h1><p class="ft-meta">${esc(msg || (navigator.onLine ? 'Der Online-Katalog ist gerade nicht erreichbar.' : 'Offline: deine eigene Musik läuft trotzdem.'))}</p></div></div></div>`;
 }
 const heroCover = (t) => t.coverHi || t.coverId;
 async function mountFeature(ids, source) {
@@ -2795,7 +3407,7 @@ function showAuth(mode = 'login') {
     <div class="auth-wall" aria-hidden="true"></div>
     <div class="auth-shade" aria-hidden="true"></div>
     <form class="auth-card" novalidate data-form="auth">
-      <div class="auth-brand"><img src="icons/icon.svg" alt=""><span><b>KLANG</b><small>MUSIK</small></span></div>
+      <div class="auth-brand"><img src="icons/icon.svg" alt=""><span><b>VERS</b><small>MUSIK</small></span></div>
       <h1>${reg ? 'Konto erstellen' : 'Willkommen zurück'}</h1>
       <p class="auth-sub">${reg ? 'Name und Passwort werden nur auf diesem Gerät gespeichert.' : 'Melde dich an. Dein Konto liegt nur auf diesem Gerät.'}</p>
       <label class="field"><span>Name</span><input name="name" autocomplete="username" autocapitalize="none" spellcheck="false" maxlength="24" required><em class="field-err" data-err="name"></em></label>
@@ -2892,7 +3504,7 @@ views.profil = () => {
       </div>
       <div class="set-card">
         <h2>Abmelden</h2>
-        <p>Deine Musik, Playlists und Favoriten bleiben auf dem Gerät. Beim nächsten Öffnen fragt Klang wieder nach Name und Passwort.</p>
+        <p>Deine Musik, Playlists und Favoriten bleiben auf dem Gerät. Beim nächsten Öffnen fragt VERS wieder nach Name und Passwort.</p>
         <button class="btn btn-danger" data-action="logout">${icon('logout')}Abmelden</button>
       </div>
     </div>`;
@@ -2962,7 +3574,7 @@ function refresh() {
 function updateNav(name) {
   const map = { album: 'albums', artist: 'artists', playlist: 'playlists', oartist: 'discover' };
   const key = map[name] || name;
-  const lib = ['songs', 'albums', 'artists', 'favorites', 'album', 'artist'].includes(name);
+  const lib = ['songs', 'albums', 'artists', 'favorites', 'album', 'artist', 'stats'].includes(name);
   $$('[data-nav]').forEach((a) => {
     const n = a.dataset.nav;
     a.classList.toggle('active', n === key || (n === 'library' && lib) || (n === 'discover-m' && ['discover', 'radio', 'oartist'].includes(name)));
@@ -3006,7 +3618,7 @@ const actions = {
   prev: () => prev(),
   shuffle: () => toggleShuffle(),
   repeat: () => cycleRepeat(),
-  mute: () => { audio.muted = !audio.muted; saveState(); },
+  mute: () => { setVolume(vol.level, !vol.muted); saveState(); },
   'open-np': () => { if (curId) openOverlay('np'); },
   'open-np-mobile': () => { if (isMobile() && curId) openOverlay('np'); },
   'close-np': () => closeOverlay('np'),
@@ -3030,13 +3642,17 @@ const actions = {
     if (!t) return;
     if (t.live) go('radio');
     else if (t.artistId) go('oartist', t.artistId);
-    else go('artist', t.artist);
+    else go('artist', artistsOf(t)[0] || t.artist);
   },
   'np-menu': (el) => { if (curId) trackMenu(curId, el, { np: true }); },
   'color-menu': (el) => colorMenu(el),
   'open-lyrics': () => { if (!curId) return; openOverlay('np'); setLyricsMode(true); },
   'toggle-lyrics': () => setLyricsMode(!lyricsOpen),
   'lyrics-edit': () => editLyrics(),
+  'search-filter': (el) => { S.searchFilter = el.dataset.f; renderSearch(); },
+  'stat-range': (el) => { S.statRange = el.dataset.r; render(true); },
+  'play-hit': (el) => { const L = lists[el.dataset.list]; if (!L) return; playIds(L.ids, +el.dataset.i, { source: L.opts.source }); openOverlay('np'); setLyricsMode(true); },
+  'lyrics-retry': () => { const t = getT(curId); if (!t) return; const box = $('#np-lyrics'); if (box) box.innerHTML = `<div class="ly-empty ly-loading"><span class="spinner"></span><p>Suche …</p></div>`; lyr.get(t, { force: true }).then((r) => { if (!r?.text) toast('Leider kein Songtext gefunden.'); renderLyrics(true); }); },
   'lyrics-file': async () => {
     const id = curId;
     const f = await pickFile('#lrc-input');
@@ -3048,9 +3664,10 @@ const actions = {
   'shuffle-list': (el) => { const L = listOf(el); if (L) playIds(L.ids, 0, { source: L.opts.source, shuffle: true }); },
   'play-album': (el) => { const a = getAlbums().get(el.dataset.key); if (a) playIds(a.tracks.map((t) => t.id), 0, { source: a.name }); },
   'artist-pic': (el) => changeArtistPic(el.dataset.name),
+  'artist-sort': (el) => { S.sort.artist = el.dataset.sort; ls.set('klang-sort', S.sort); render(true); },
   'play-artist': (el) => {
-    const a = getArtists().get(el.dataset.name.toLowerCase());
-    if (a) playIds(a.tracks.slice().sort((x, y) => coll.compare(x.album, y.album) || (x.trackNo || 0) - (y.trackNo || 0)).map((t) => t.id), 0, { source: a.name });
+    const a = getArtists().get(artKey(el.dataset.name));
+    if (a) playIds(artistTrackOrder(a.tracks, 'new'), 0, { source: a.name });
   },
   'play-playlist': (el) => { const p = S.playlists.find((x) => x.id === el.dataset.id); if (p) playIds(p.trackIds, 0, { source: p.name }); },
   'play-favs': () => playIds([...S.tracks.values()].filter((t) => t.fav).sort((a, b) => (b.favAt || 0) - (a.favAt || 0)).map((t) => t.id), 0, { source: 'Favoriten' }),
@@ -3095,10 +3712,59 @@ const actions = {
   'playlist-menu': (el) => playlistMenu(el.dataset.id, el),
   'new-playlist': async () => { const p = await newPlaylistFlow(); if (p) go('playlist', p.id); },
   accent: (el) => setAccent(el.dataset.name),
-  'toggle-live': (el) => { const on = !liveCoverOn(); ls.set('klang-live', on); applyLiveCover(); el.textContent = on ? 'An' : 'Aus'; },
+  'toggle-live': (el) => { const on = !liveCoverOn(); ls.set('klang-live', on); applyLiveCover(); setSwitch(el, on); },
+  theme: (el) => { ls.set('klang-theme', el.dataset.id); applyTheme(); $$('.theme').forEach((b) => { const on = b === el; b.classList.toggle('on', on); b.setAttribute('aria-pressed', on); }); },
+  motion: (el) => { setMotion(el.dataset.v); segSelect(el); toast(el.dataset.v === 'calm' ? 'Animationen ruhig' : 'Animationen voll', 1400); },
+  'pb-gapless': (el) => { PB.gapless = !PB.gapless; savePB(); setSwitch(el, PB.gapless); if (!PB.gapless) dropPrep(); },
+  'pb-mix': (el) => { PB.smartMix = el.dataset.v; savePB(); segSelect(el); },
+  'pb-share': (el) => { PB.shareStatus = !PB.shareStatus; savePB(); setSwitch(el, PB.shareStatus); if (PB.shareStatus) sendPresence(); else { const c = cloudCfg(); const body = JSON.stringify({ paused: true }); if (S.srvOK) fetch(withKey('/api/presence'), { method: 'POST', body }).catch(() => {}); else if (c) fetch(`${c.url}/api/now?k=${encodeURIComponent(c.key)}`, { method: 'PUT', body }).catch(() => {}); } },
+  'discord-toggle': async (el) => {
+    const id = ($('[data-discord-id]')?.value || '').replace(/\D/g, '');
+    const on = !el.classList.contains('on');
+    if (on && id.length < 15) { toast('Bitte zuerst die Application-ID eintragen (siehe Anleitung darunter).', 3500); $('[data-discord-id]')?.focus(); return; }
+    el.disabled = true;
+    try { await fetch('/api/discord', { method: 'POST', body: JSON.stringify({ clientId: id, enabled: on }) }); } catch { /* */ }
+    await renderDiscordBox();
+    if (on) setTimeout(() => { sendPresence(); renderDiscordBox(); }, 1500);
+  },
+  'set-jump': (el, e) => { e?.preventDefault(); $(`#set-${el.dataset.k}`)?.scrollIntoView({ behavior: reducedMotion() ? 'auto' : 'smooth', block: 'start' }); },
+  'lyrics-all': async (el) => {
+    el.disabled = true;
+    const lab = el.querySelector('[data-lyrics-progress]');
+    await lyr.prefetch([...S.tracks.values()].filter((t) => !t.live && !isOnline(t)), (d, n) => { if (lab?.isConnected) lab.textContent = `${d} / ${n}`; });
+    if (lab?.isConnected) lab.textContent = 'Fertig';
+    toast('Songtexte geladen. Sie gehen jetzt auch offline.');
+  },
+  'covers-all': async (el) => {
+    el.disabled = true;
+    const lab = el.querySelector('[data-cover-progress]');
+    const ids = [...new Set([...S.tracks.values()].map((t) => t.coverId).filter((c) => c?.startsWith('c:')))];
+    let d = 0;
+    for (const id of ids) { await coverUrl(id); d++; if (lab?.isConnected && d % 5 === 0) lab.textContent = `${d} / ${ids.length}`; }
+    if (lab?.isConnected) lab.textContent = 'Fertig';
+  },
+  'stats-export': () => {
+    const blob = new Blob([stats.exportJSON()], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `VERS-Statistik-${stats.dayKey()}.json`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+  },
+  'stats-reset': async () => {
+    if (!await confirmDialog('Statistik zurücksetzen?', 'Alle gezählten Minuten, Top-Künstler und Top-Songs werden auf diesem Gerät gelöscht.', 'Zurücksetzen', true)) return;
+    stats.reset();
+    render(true);
+    toast('Statistik zurückgesetzt');
+  },
+  'lyrics-clear': async () => {
+    if (!await confirmDialog('Songtexte löschen?', 'Die gespeicherten Songtexte werden entfernt und beim nächsten Abspielen neu geladen. Selbst eingefügte Texte bleiben.', 'Löschen', true)) return;
+    await lyr.clearAll();
+    render(true);
+  },
   persist: async () => {
     const ok = await navigator.storage?.persist?.();
-    toast(ok ? 'Dauerhafter Speicher aktiviert' : 'Der Browser hat abgelehnt. Installiere Klang als App, dann klappt es meist.', 4000);
+    toast(ok ? 'Dauerhafter Speicher aktiviert' : 'Der Browser hat abgelehnt. Installiere VERS als App, dann klappt es meist.', 4000);
     after.settings();
   },
   install: async () => {
@@ -3242,15 +3908,13 @@ function setupEvents() {
     });
   });
   npEls.vol.forEach((r) => r.addEventListener('input', () => {
-    audio.volume = r.value / 100;
-    audio.muted = r.value == 0;
+    setVolume(r.value / 100, r.value == 0);
     saveState();
   }));
   $('#player').addEventListener('wheel', (e) => {
     if (!e.target.closest('.pb-right')) return;
     e.preventDefault();
-    audio.muted = false;
-    audio.volume = Math.min(1, Math.max(0, audio.volume - Math.sign(e.deltaY) * 0.05));
+    setVolume(vol.level - Math.sign(e.deltaY) * 0.05, false);
   }, { passive: false });
 
   // Drag & Drop: Dateien importieren
@@ -3323,9 +3987,9 @@ function setupEvents() {
     if (k === ' ') togglePlay();
     else if (k === 'ArrowRight') e.shiftKey ? next() : (audio.currentTime = Math.min(audio.duration || 0, audio.currentTime + 5));
     else if (k === 'ArrowLeft') e.shiftKey ? prev() : (audio.currentTime = Math.max(0, audio.currentTime - 5));
-    else if (k === 'ArrowUp') { audio.muted = false; audio.volume = Math.min(1, audio.volume + 0.05); }
-    else if (k === 'ArrowDown') audio.volume = Math.max(0, audio.volume - 0.05);
-    else if (k === 'm' || k === 'M') audio.muted = !audio.muted;
+    else if (k === 'ArrowUp') setVolume(vol.level + 0.05, false);
+    else if (k === 'ArrowDown') setVolume(vol.level - 0.05);
+    else if (k === 'm' || k === 'M') setVolume(vol.level, !vol.muted);
     else if (k === 's' || k === 'S') toggleShuffle();
     else if (k === 'r' || k === 'R') cycleRepeat();
     else if (k === 'l' || k === 'L') actions['fav-current']();
@@ -3383,7 +4047,7 @@ window.addEventListener('beforeinstallprompt', (e) => {
 window.addEventListener('appinstalled', () => {
   deferredInstall = null;
   $$('[data-install]').forEach((b) => b.classList.add('hidden'));
-  toast('Klang wurde installiert 🎉');
+  toast('VERS wurde installiert 🎉');
 });
 
 function registerSW() {
@@ -3393,7 +4057,7 @@ function registerSW() {
 }
 
 function setupLaunchQueue() {
-  // Am PC: Audiodateien per Doppelklick / "Öffnen mit" direkt in Klang öffnen
+  // Am PC: Audiodateien per Doppelklick / "Öffnen mit" direkt in VERS öffnen
   if (!('launchQueue' in window)) return;
   window.launchQueue.setConsumer(async (params) => {
     if (!params.files?.length) return;
@@ -3410,6 +4074,48 @@ function setupLaunchQueue() {
 /* =========================================================
    Server-Bibliothek (Musik aus Downloads/music)
    ========================================================= */
+// ---- Katalog: saubere Titel, alle Künstler, Album, Jahr, Länge und das eigene Cover jedes Songs ----
+async function fetchCatalog(url) {
+  try {
+    const r = await fetch(url, { cache: 'no-store' });
+    if (!r.ok) return null;
+    const j = await r.json();
+    return Array.isArray(j?.tracks) ? j : null;
+  } catch { return null; }
+}
+// Übernimmt die Katalog-Infos in einen Titel. Gibt true zurück, wenn sich etwas geändert hat.
+function applyMeta(t, c, v) {
+  if (!c || t.cv === v) return false;
+  Object.assign(t, {
+    title: c.title, version: c.version || '', artists: c.artists.slice(), artist: c.artists.join(', '),
+    album: c.album || c.title, albumArtist: c.albumArtist || c.artists[0], year: c.year || '', genre: c.genre || '',
+    trackNo: c.trackNo || 0, discNo: c.discNo || 0, duration: c.dur || t.duration || 0, dup: c.dup || '',
+    coverId: c.cover ? 'c:' + c.cover : (t.coverId?.startsWith('a:') ? null : t.coverId), cv: v,
+  });
+  return true;
+}
+// Doppelte Songs ausblenden: Favorit, Playlists und Warteschlange gehen auf die behaltene Version über
+async function dropDuplicates(idOf) {
+  const gone = [...S.tracks.values()].filter((t) => t.dup && S.tracks.has(idOf(t.dup)));
+  if (!gone.length) return 0;
+  const pls = new Set();
+  const swap = new Map();
+  for (const t of gone) {
+    const keep = S.tracks.get(idOf(t.dup));
+    swap.set(t.id, keep.id);
+    if (t.fav && !keep.fav) { keep.fav = true; keep.favAt = t.favAt; db.put('tracks', keep).catch(() => {}); }
+    keep.playCount = Math.max(keep.playCount || 0, t.playCount || 0);
+    for (const p of S.playlists) p.trackIds = p.trackIds.map((id) => { if (id === t.id) { pls.add(p); return keep.id; } return id; });
+    S.tracks.delete(t.id);
+    db.del('tracks', t.id).catch(() => {});
+  }
+  const sw = (id) => swap.get(id) || id;
+  S.queue = S.queue.map(sw); S.original = S.original.map(sw);
+  if (swap.has(curId)) curId = swap.get(curId);
+  for (const p of pls) await savePlaylist(p);
+  invalidate();
+  return gone.length;
+}
 async function loadServerLibrary(showToast = false) {
   let list;
   try {
@@ -3422,8 +4128,8 @@ async function loadServerLibrary(showToast = false) {
     list = await r.json();
     if (!Array.isArray(list)) throw new Error('unerwartete Antwort');
   } catch {
-    // Kein lokaler Klang-Server (z. B. auf der Online-Version): Knopf bleibt versteckt
-    if (showToast) toast('Der Musik-Ordner geht nur mit dem Klang-Server auf deinem PC („Klang starten.bat“).', 4500);
+    // Kein lokaler VERS-Server (z. B. auf der Online-Version): Knopf bleibt versteckt
+    if (showToast) toast('Der Musik-Ordner geht nur mit dem VERS-Server auf deinem PC („VERS starten.bat“).', 4500);
     return;
   }
   $$('[data-server-lib]').forEach((b) => b.classList.remove('hidden'));
@@ -3437,14 +4143,21 @@ async function loadServerLibrary(showToast = false) {
     return;
   }
 
+  const cat = await fetchCatalog(withKey('/api/catalog'));
+  if (cat) coverBase = (f) => withKey('/covers/' + f);
+  const meta = new Map((cat?.tracks || []).map((c) => [c.f, c]));
   let added = 0;
   const fresh = [];
   for (const item of list) {
     const id = 'srv:' + item.url;
     const known = S.tracks.get(id);
+    const c = meta.get(item.url.slice('/music/'.length));
+    if (!known && c?.dup && meta.has(c.dup)) continue; // doppelt: nur eine Version zeigen
     if (known) {
       // Dateigröße nachtragen (für die Paketgröße „für unterwegs“)
-      if (item.size && known.size !== item.size) { known.size = item.size; fresh.push(known); }
+      let ch = applyMeta(known, c, cat?.v);
+      if (item.size && known.size !== item.size) { known.size = item.size; ch = true; }
+      if (ch) fresh.push(known);
       continue;
     }
     const title = item.file.replace(/\.[^.]+$/, '');
@@ -3464,11 +4177,14 @@ async function loadServerLibrary(showToast = false) {
       fav: false, favAt: 0, playCount: 0, lastPlayed: 0,
       addedAt: Date.now(),
     };
+    applyMeta(track, c, cat?.v);
     S.tracks.set(id, track);
     fresh.push(track);
     added++;
   }
   if (fresh.length) { try { await db.putMany('tracks', fresh); } catch { /* */ } }
+  const dropped = await dropDuplicates((f) => 'srv:/music/' + f);
+  if (fresh.length > added || dropped) { invalidate(); refresh(); if (curId) updatePlayerUI(); }
 
   if (added > 0) {
     invalidate();
@@ -3508,6 +4224,10 @@ async function loadCloudLibrary(showToast = false) {
     return;
   }
   S.cloudOK = true;
+  const k = encodeURIComponent(c.key);
+  const cat = await fetchCatalog(`${c.url}/api/catalog?k=${k}`);
+  if (cat) coverBase = (f) => `${c.url}/covers/${f}?k=${k}`;
+  const meta = new Map((cat?.tracks || []).map((x) => [x.f, x]));
   let added = 0;
   const fresh = [];
   for (const item of list) {
@@ -3515,7 +4235,14 @@ async function loadCloudLibrary(showToast = false) {
     try { path = item.url.split('/').map(decodeURIComponent).join('/'); } catch { continue; }
     const id = 'cloud:' + path;
     const known = S.tracks.get(id);
-    if (known) { if (item.size && known.size !== item.size) { known.size = item.size; fresh.push(known); } continue; }
+    const m = meta.get(path.slice('/music/'.length));
+    if (!known && m?.dup && meta.has(m.dup)) continue;
+    if (known) {
+      let ch = applyMeta(known, m, cat?.v);
+      if (item.size && known.size !== item.size) { known.size = item.size; ch = true; }
+      if (ch) fresh.push(known);
+      continue;
+    }
     const track = {
       id, remote: 'cloud', streamUrl: path,
       title: item.file.replace(/\.[^.]+$/, ''),
@@ -3526,14 +4253,15 @@ async function loadCloudLibrary(showToast = false) {
       fileName: item.file, size: item.size || 0, coverId: null,
       fav: false, favAt: 0, playCount: 0, lastPlayed: 0, addedAt: Date.now(),
     };
+    applyMeta(track, m, cat?.v);
     S.tracks.set(id, track);
     fresh.push(track);
     added++;
   }
   if (fresh.length) { try { await db.putMany('tracks', fresh); } catch { /* */ } }
-  if (added) { invalidate(); refresh(); }
+  const dropped = await dropDuplicates((f) => 'cloud:/music/' + f);
+  if (fresh.length || dropped) { invalidate(); refresh(); if (curId) updatePlayerUI(); }
   if (showToast) toast(added ? `${plural(added, 'Song', 'Songs')} aus der Cloud geladen` : `Alles aktuell: ${plural(list.length, 'Song', 'Songs')} in der Cloud`, 3000);
-  const k = encodeURIComponent(c.key);
   syncArtistPics({ list: `${c.url}/api/pics?k=${k}`, file: (u) => `${c.url}${u}?k=${k}` });
 }
 function cloudDisconnect() {
@@ -3550,7 +4278,7 @@ function encPath(p) { return p.split('/').map((s) => encodeURIComponent(s)).join
 function packBtn(k) {
   if (!S.srvOK) return '';
   const n = (lists[k]?.ids || []).filter((id) => getT(id)?.remote === 'server').length;
-  return n ? `<button class="btn btn-sm pack-btn" data-action="pack" data-list="${k}" title="Songs aufs Handy kopieren, offline hören">${icon('download')}Für unterwegs</button>` : '';
+  return n ? `<button class="btn btn-sm pack-btn" data-action="pack" data-list="${k}" title="Songs aufs Handy kopieren, offline hören" aria-label="Für unterwegs">${icon('download')}<span>Für unterwegs</span></button>` : '';
 }
 async function packFor(k) {
   const L = lists[k];
@@ -3565,7 +4293,7 @@ async function packFor(k) {
       ${tooBig ? '<p class="field-err">Das sind mehr als 3,9 GB. Bitte eine kleinere Playlist wählen.</p>' : `
       <ol class="steps">
         <li>Paket herunterladen (am besten im WLAN, das dauert etwas).</li>
-        <li>Deine <b>Klang-App</b> vom Startbildschirm öffnen.</li>
+        <li>Deine <b>VERS-App</b> vom Startbildschirm öffnen.</li>
         <li><b>Musik hinzufügen</b> tippen und die ZIP-Datei wählen.</li>
       </ol>
       <p class="small muted">Danach liegen die Songs auf dem Handy und laufen offline, auch ohne PC und ohne Internet. Platz auf dem Handy nicht vergessen.</p>`}`,
@@ -3575,7 +4303,7 @@ async function packFor(k) {
   let res;
   try {
     res = await fetch(withKey('/api/pack'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ files: uniq.map((t) => encPath(t.streamUrl)) }) });
-  } catch { toast('Der PC ist nicht erreichbar. Läuft das schwarze Klang-Fenster?', 4500); return; }
+  } catch { toast('Der PC ist nicht erreichbar. Läuft das schwarze VERS-Fenster?', 4500); return; }
   const d = await res.json().catch(() => ({}));
   if (!res.ok) { toast(d.error || 'Das Paket konnte nicht erstellt werden.', 4500); return; }
   const a = document.createElement('a');
@@ -3584,7 +4312,7 @@ async function packFor(k) {
   document.body.appendChild(a);
   a.click();
   a.remove();
-  toast(`Download startet: ${plural(d.count, 'Song', 'Songs')}, ${fmtBytes(d.size)}. Danach in der Klang-App unter „Musik hinzufügen“ wählen.`, 7000);
+  toast(`Download startet: ${plural(d.count, 'Song', 'Songs')}, ${fmtBytes(d.size)}. Danach in der VERS-App unter „Musik hinzufügen“ wählen.`, 7000);
 }
 
 /* ---------- Aufs Handy: QR-Code mit WLAN-Adresse und Schlüssel ---------- */
@@ -3610,11 +4338,11 @@ async function phoneConnect(forceLan = false) {
       const n = [...S.tracks.values()].filter((t) => t.remote === 'server').length;
       const pending = openDialog({
         title: 'Aufs Handy',
-        body: `<div class="qr">${qr.createSvgTag({ cellSize: 5, margin: 2, scalable: true, alt: 'QR-Code für Klang mit Cloud-Zugang' })}</div>
+        body: `<div class="qr">${qr.createSvgTag({ cellSize: 5, margin: 2, scalable: true, alt: 'QR-Code für VERS mit Cloud-Zugang' })}</div>
           <ol class="steps">
             <li>Code mit der <b>Handy-Kamera</b> scannen und den Link öffnen.</li>
             <li>Einloggen. ${n ? `Deine ${n.toLocaleString('de')} Songs` : 'Deine Songs'} kommen aus deiner privaten Cloud, <b>überall</b>, auch ohne WLAN und ohne PC.</li>
-            <li>Klang zum Startbildschirm hinzufügen (iPhone: Teilen → „Zum Home-Bildschirm“).</li>
+            <li>VERS zum Startbildschirm hinzufügen (iPhone: Teilen → „Zum Home-Bildschirm“).</li>
           </ol>
           <p class="small muted">Der Code enthält deinen geheimen Cloud-Schlüssel. Zeig ihn niemandem. Unterwegs braucht das Handy Internet.</p>
           <div class="btns qr-btns"><button class="btn" type="button" data-copy-link>${icon('link')}Link kopieren</button><a class="btn" href="${esc(link)}" target="_blank" rel="noopener">${icon('external')}Hier am PC öffnen</a></div>
@@ -3636,14 +4364,14 @@ async function phoneConnect(forceLan = false) {
     const r = await fetch('/api/lan', { cache: 'no-store' });
     if (!r.ok) throw new Error();
     info = await r.json();
-  } catch { toast('„Aufs Handy“ geht nur am PC mit dem Klang-Server.'); return; }
+  } catch { toast('„Aufs Handy“ geht nur am PC mit dem VERS-Server.'); return; }
   if (!info.lan || !info.urls.length) {
     openDialog({
       title: 'Aufs Handy',
-      body: `<p>Damit dein Handy mithören kann, muss Klang im WLAN-Modus laufen:</p>
+      body: `<p>Damit dein Handy mithören kann, muss VERS im WLAN-Modus laufen:</p>
         <ol class="steps">
-          <li>Das schwarze Klang-Fenster schließen.</li>
-          <li>Im Klang-Ordner auf <b>„Klang fürs Handy starten.bat“</b> doppelklicken.</li>
+          <li>Das schwarze VERS-Fenster schließen.</li>
+          <li>Im VERS-Ordner auf <b>„VERS fürs Handy starten.bat“</b> doppelklicken.</li>
           <li>Fragt Windows nach der Firewall: <b>Zulassen</b> für private Netzwerke.</li>
           <li>Hier wieder auf <b>„Aufs Handy“</b> klicken.</li>
         </ol>`,
@@ -3653,7 +4381,7 @@ async function phoneConnect(forceLan = false) {
   }
   await loadScript('js/vendor/qrcode.js');
   const urls = info.urls.slice().sort((a, b) => ipRank(a) - ipRank(b)).map((u) => `${u}?k=${encodeURIComponent(info.key)}`);
-  const qrSvg = (url) => { const qr = qrcode(0, 'M'); qr.addData(url); qr.make(); return qr.createSvgTag({ cellSize: 6, margin: 2, scalable: true, alt: 'QR-Code für Klang am Handy' }); };
+  const qrSvg = (url) => { const qr = qrcode(0, 'M'); qr.addData(url); qr.make(); return qr.createSvgTag({ cellSize: 6, margin: 2, scalable: true, alt: 'QR-Code für VERS am Handy' }); };
   const n = [...S.tracks.values()].filter((t) => t.remote === 'server').length;
   openDialog({
     title: 'Aufs Handy',
@@ -3663,7 +4391,7 @@ async function phoneConnect(forceLan = false) {
         <li>Code mit der <b>Handy-Kamera</b> scannen und den Link öffnen.</li>
         <li>Einloggen: ${n ? `deine ${n.toLocaleString('de')} Songs` : 'deine Songs'} spielen vom PC.</li>
       </ol>
-      <p class="small muted">Das schwarze Klang-Fenster am PC muss dabei offen bleiben. Tipp: Im Handy-Browser „Zum Startbildschirm hinzufügen“, dann hast du ein Icon.</p>
+      <p class="small muted">Das schwarze VERS-Fenster am PC muss dabei offen bleiben. Tipp: Im Handy-Browser „Zum Startbildschirm hinzufügen“, dann hast du ein Icon.</p>
       ${urls.length > 1 ? `<p class="small muted">Klappt nicht? Andere Adresse probieren: ${urls.map((u, i) => `<button class="link qr-alt" type="button" data-qr-url="${esc(u)}">${esc(new URL(u).host)}</button>${i < urls.length - 1 ? ' · ' : ''}`).join('')}</p>` : ''}
       <details class="small"><summary>Adresse zum Abtippen</summary><code class="qr-url">${esc(urls[0])}</code></details>`,
     buttons: [{ label: 'Fertig', primary: true, value: 'ok' }],
@@ -3678,7 +4406,8 @@ async function phoneConnect(forceLan = false) {
 
 async function init() {
   hydrateIcons(document);
-  applyAccent(ls.get('klang-accent', 'Gold'));
+  applyTheme();
+  setMotion(ls.get('klang-motion', 'full'));
   cacheNpEls();
   applyLiveCover();
   updateEqButtons();
@@ -3690,6 +4419,7 @@ async function init() {
     tracks.forEach((t) => { S.tracks.set(t.id, t); regAlts(t.coverId, t.coverAlts); });
     S.playlists = playlists;
     coverKeys = new Set(ckeys);
+    await lyr.loadAll();
   } catch (e) {
     console.error(e);
     toast('Die Bibliothek konnte nicht geladen werden. Ist der private Modus aktiv?', 6000);
@@ -3698,6 +4428,7 @@ async function init() {
   setupEvents();
   setupWallHover();
   setupMediaSession();
+  setupQueueDrag();
   renderSidebarPlaylists();
   updateProfileUI();
   render();
@@ -3706,7 +4437,12 @@ async function init() {
   setupLaunchQueue();
   registerSW();
   // Musik-Ordner automatisch laden; ohne PC-Server (z. B. unterwegs am Handy) den Cloud-Speicher
-  loadServerLibrary(false).then(() => { if (!S.srvOK && cloudCfg()) loadCloudLibrary(false); });
+  loadServerLibrary(false).then(async () => {
+    if (!S.srvOK && cloudCfg()) await loadCloudLibrary(false);
+    // Songtexte im Hintergrund holen, damit sie überall und offline da sind
+    const idle = window.requestIdleCallback || ((f) => setTimeout(f, 4000));
+    idle(() => lyr.prefetch([...S.tracks.values()].filter((t) => !t.live && !isOnline(t))), { timeout: 8000 });
+  });
 }
 
 init();

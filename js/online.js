@@ -3,7 +3,7 @@
 //  - Radio Browser (radio-browser.info): offenes Verzeichnis von Internetradio-Sendern.
 
 const AUDIUS = 'https://api.audius.co/v1';
-const APP = 'Klang';
+const APP = 'VERS';
 
 async function aget(path, params = {}) {
   const q = new URLSearchParams({ ...params, app_name: APP });

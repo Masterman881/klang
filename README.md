@@ -1,6 +1,6 @@
-# Klang
+# VERS
 
-Ein eigener Musikplayer als Web-App – offline, werbefrei, kostenlos.
+Ein eigener Musikplayer als Web-App – mit Songtexten, Hörstatistik, Smart Shuffle und Überblenden. Offline, werbefrei, kostenlos.
 Spielt eigene Musikdateien (MP3, M4A, FLAC, OGG, WAV) direkt im Browser ab.
 Die Musik bleibt auf dem Gerät und wird nirgendwo hochgeladen.
 

@@ -1,6 +1,6 @@
 // Kleine IndexedDB-Hülle. Alles bleibt lokal auf dem Gerät.
 const DB_NAME = 'klang-db';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 let dbp = null;
 
 function open() {
@@ -9,7 +9,7 @@ function open() {
       const req = indexedDB.open(DB_NAME, DB_VERSION);
       req.onupgradeneeded = () => {
         const db = req.result;
-        for (const name of ['tracks', 'audio', 'covers', 'playlists']) {
+        for (const name of ['tracks', 'audio', 'covers', 'playlists', 'lyrics']) {
           if (!db.objectStoreNames.contains(name)) db.createObjectStore(name, { keyPath: 'id' });
         }
       };
