@@ -45,6 +45,7 @@
         <button class="btn wide hidden" data-action="install" data-install><i data-icon="download"></i>App installieren</button>
         <nav class="side-nav">
           <a href="#/settings" data-nav="settings"><i data-icon="settings"></i>Einstellungen</a>
+          <a href="#" data-action="color-menu"><i data-icon="palette"></i>Farbe &amp; Live-Cover</a>
         </nav>
       </div>
     </aside>
@@ -77,6 +78,7 @@
         </div>
       </div>
       <div class="pb-right d-only">
+        <button class="icon-btn" data-action="open-lyrics" title="Songtext (T)"><i data-icon="lyrics"></i></button>
         <button class="icon-btn" data-action="sleep" data-np="sleep" title="Sleep-Timer"><i data-icon="moon"></i></button>
         <button class="icon-btn" data-action="queue" data-np="queue-btn" title="Warteschlange (Q)"><i data-icon="queue"></i></button>
         <button class="icon-btn" data-action="mute" data-np="vol-icon" title="Stumm (M)"><i data-icon="volume"></i></button>
@@ -96,6 +98,7 @@
 
   <!-- Vollbild-Wiedergabe -->
   <section id="np" aria-label="Aktuelle Wiedergabe">
+    <div class="np-live" aria-hidden="true"><div class="np-live-img"></div></div>
     <div class="np-inner">
       <header class="np-head">
         <button class="icon-btn lg" data-action="close-np" aria-label="Schließen"><i data-icon="chevron-down"></i></button>
@@ -103,6 +106,7 @@
         <button class="icon-btn lg" data-action="np-menu" aria-label="Mehr"><i data-icon="more"></i></button>
       </header>
       <div class="np-art"><div class="cover" data-np="cover"></div></div>
+      <div class="np-lyrics" id="np-lyrics" aria-live="off"></div>
       <div class="np-meta">
         <div class="bug-tab lg" aria-hidden="true"><small data-np="bug-label">Läuft</small><b data-np="cur">0:00</b></div>
         <div class="np-text">
@@ -123,8 +127,9 @@
         <button class="icon-btn lg" data-action="repeat" data-np="repeat" aria-label="Wiederholen"><i data-icon="repeat"></i></button>
       </div>
       <div class="np-extra">
-        <button class="pill-btn" data-action="sleep" data-np="sleep"><i data-icon="moon"></i><span data-np="sleep-label">Sleep-Timer</span></button>
-        <button class="pill-btn" data-action="queue"><i data-icon="queue"></i><span>Warteschlange</span></button>
+        <button class="pill-btn" data-action="sleep" data-np="sleep" aria-label="Sleep-Timer"><i data-icon="moon"></i><span data-np="sleep-label">Sleep-Timer</span></button>
+        <button class="pill-btn" data-action="toggle-lyrics" data-np="lyrics-btn"><i data-icon="lyrics"></i><span>Songtext</span></button>
+        <button class="pill-btn" data-action="queue" aria-label="Warteschlange"><i data-icon="queue"></i><span>Warteschlange</span></button>
       </div>
     </div>
   </section>
@@ -145,7 +150,8 @@
   <div id="toasts" aria-live="polite"></div>
   <div id="drop-overlay"><div><i data-icon="upload"></i><p>Loslassen, um Musik hinzuzufügen</p></div></div>
 
-  <input type="file" id="file-input" multiple accept="audio/*,.mp3,.m4a,.flac,.ogg,.oga,.opus,.wav,.aac,.webm" hidden>
+  <input type="file" id="file-input" multiple accept="audio/*,.mp3,.m4a,.flac,.ogg,.oga,.opus,.wav,.aac,.webm,.lrc" hidden>
+  <input type="file" id="lrc-input" accept=".lrc,.txt,text/plain" hidden>
   <input type="file" id="folder-input" webkitdirectory multiple hidden>
   <input type="file" id="image-input" accept="image/*" hidden>
 

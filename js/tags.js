@@ -27,6 +27,15 @@ function decodeText(enc, b) {
   else s = smart8(b);
   return s.replace(/^\u0000+/, '').split('\u0000')[0].trim();
 }
+// Langer Text (Songtexte): Zeilenumbrüche behalten, nicht beim ersten Null-Zeichen abschneiden
+function decodeFull(enc, b) {
+  let s;
+  if (enc === 1) s = utf16(b, true);
+  else if (enc === 2) s = utf16(b, false);
+  else if (enc === 3) s = utf8(b);
+  else s = smart8(b);
+  return s.replace(/\u0000/g, '').replace(/\r\n?/g, '\n').trim();
+}
 function unsync(b) {
   const out = new Uint8Array(b.length);
   let j = 0;
@@ -89,6 +98,15 @@ async function readID3v2(file, head) {
       else if (key === 'year') out[key] = year(v);
       else if (key === 'genre') out[key] = v.replace(/^\((\d+)\)/, '').trim();
       else out[key] = v;
+    } else if ((id === 'USLT' || id === 'ULT') && !out.lyrics) {
+      try {
+        const enc = frame[0];
+        let p = 4; // Kodierung + 3 Zeichen Sprache
+        if (enc === 1 || enc === 2) { while (p + 1 < frame.length && !(frame[p] === 0 && frame[p + 1] === 0)) p += 2; p += 2; }
+        else { while (p < frame.length && frame[p] !== 0) p++; p++; }
+        const text = decodeFull(enc, frame.subarray(p));
+        if (text) out.lyrics = text;
+      } catch { /* */ }
     } else if (id === 'APIC' || id === 'PIC') {
       try {
         const enc = frame[0];
@@ -144,6 +162,11 @@ function vorbisComments(b, out) {
     }
     const val = utf8(entry.subarray(eq + 1)).trim();
     if (!val) continue;
+    if (key === 'LYRICS' || key === 'UNSYNCEDLYRICS' || key === 'SYNCEDLYRICS') {
+      // synchronisierte Texte bevorzugen
+      if (!out.lyrics || (key === 'SYNCEDLYRICS' && !/\[\d+:\d/.test(out.lyrics))) out.lyrics = val.replace(/\r\n?/g, '\n');
+      continue;
+    }
     switch (key) {
       case 'TITLE': out.title ||= val; break;
       case 'ARTIST': out.artist ||= val; break;
@@ -258,6 +281,7 @@ async function readMP4(file) {
         case 'aART': out.albumArtist = text(); break;
         case '©day': out.year = year(text()); break;
         case '©gen': out.genre = text(); break;
+        case '©lyr': out.lyrics = utf8(v).replace(/\r\n?/g, '\n').trim(); break;
         case 'trkn': if (v.length >= 4) out.trackNo = (v[2] << 8) | v[3]; break;
         case 'disk': if (v.length >= 4) out.discNo = (v[2] << 8) | v[3]; break;
         case 'covr': if (!out.picture && v.length > 100) out.picture = { mime: sniffMime(v), data: v.slice() }; break;
@@ -306,5 +330,6 @@ export async function readTags(file) {
     trackNo: num(tags.trackNo),
     discNo: num(tags.discNo),
     picture: tags.picture || null,
+    lyrics: tags.lyrics || '',
   };
 }

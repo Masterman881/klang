@@ -337,7 +337,8 @@ function openMenu(items, anchor) {
   layer.innerHTML = `<div class="menu-backdrop"></div><div class="menu" role="menu">${items.map((it, i) => {
     if (it.sep) return '<div class="menu-sep"></div>';
     if (it.header) return `<div class="menu-head">${it.header}</div>`;
-    return `<button class="menu-item ${it.danger ? 'danger' : ''} ${it.checked ? 'checked' : ''}" data-mi="${i}" role="menuitem">${icon(it.icon || 'dot')}<span>${esc(it.label)}</span></button>`;
+    const lead = it.swatch ? `<span class="swatch-dot" style="background:${it.swatch}"></span>` : icon(it.icon || 'dot');
+    return `<button class="menu-item ${it.danger ? 'danger' : ''} ${it.checked ? 'checked' : ''}" data-mi="${i}" role="menuitem">${lead}<span>${esc(it.label)}</span>${it.checked ? icon('check', 'tick') : ''}</button>`;
   }).join('')}</div>`;
   layer.classList.add('open');
   hydrateCovers(layer);
@@ -384,7 +385,11 @@ function closeAllOverlays() {
   while (overlays.length) setOverlayClass(overlays.pop(), false);
 }
 function setOverlayClass(name, on) {
-  if (name === 'np') $('#np').classList.toggle('open', on);
+  if (name === 'np') {
+    $('#np').classList.toggle('open', on);
+    if (on && lyricsOpen) { renderLyrics(true); startLyricsLoop(); }
+    if (!on) cancelAnimationFrame(lyricsRaf);
+  }
   if (name === 'queue') { $('#queue').classList.toggle('open', on); $('#queue-backdrop').classList.toggle('open', on); }
 }
 window.addEventListener('popstate', () => {
@@ -674,7 +679,7 @@ function updatePosState() {
 const npEls = {};
 let lastShownId = null;
 function cacheNpEls() {
-  for (const k of ['title', 'artist-link', 'cover', 'fav', 'play', 'shuffle', 'repeat', 'cur', 'dur', 'bar', 'source', 'sleep', 'sleep-label', 'vol-icon', 'bug-label']) {
+  for (const k of ['title', 'artist-link', 'cover', 'fav', 'play', 'shuffle', 'repeat', 'cur', 'dur', 'bar', 'source', 'sleep', 'sleep-label', 'vol-icon', 'bug-label', 'lyrics-btn']) {
     npEls[k] = $$(`[data-np="${k}"]`);
   }
   npEls.seek = $$('[data-seek]');
@@ -707,6 +712,13 @@ async function updatePlayerUI() {
     $$('.pb-left, .np-meta').forEach((el) => { el.classList.remove('wipe'); void el.offsetWidth; el.classList.add('wipe'); });
   }
   const id = curId;
+  if (lyricsOpen && overlays.includes('np')) renderLyrics();
+  // Live-Cover: großes, unscharfes Cover treibt langsam hinter dem Vollbild-Player
+  const liveImg = $('.np-live-img');
+  const liveUrl = t.coverId && !t.live ? await coverUrl(t.coverId) : null;
+  if (id !== curId) return;
+  liveImg.style.backgroundImage = liveUrl ? `url("${liveUrl.replace(/"/g, '%22')}")` : '';
+  $('.np-live').classList.toggle('has-img', !!liveUrl);
   const tint = await tintOf(t.coverId);
   if (id !== curId) return;
   const c = tint || `hsl(${hue(t.album + t.artist)} 35% 32%)`;
@@ -802,6 +814,138 @@ function sleepMenu(anchor) {
 }
 
 /* =========================================================
+   Live-Lyrics
+   ========================================================= */
+// LRC: [mm:ss.xx]Zeile – mehrere Zeitstempel pro Zeile erlaubt, [offset:+/-ms] wird beachtet
+function parseLyrics(text) {
+  if (!text || !text.trim()) return null;
+  const stampRe = /\[(\d{1,3}):(\d{1,2}(?:[.:]\d{1,3})?)\]/g;
+  let offset = 0;
+  const timed = [];
+  const plain = [];
+  for (const raw of text.replace(/\r\n?/g, '\n').split('\n')) {
+    const line = raw.trim();
+    const off = line.match(/^\[offset:\s*([+-]?\d+)\]$/i);
+    if (off) { offset = +off[1] / 1000; continue; }
+    if (/^\[[a-z]+:[^\]]*\]$/i.test(line)) continue; // [ar:…], [ti:…] usw.
+    const stamps = [...line.matchAll(stampRe)];
+    const txt = line.replace(stampRe, '').replace(/<\d{1,3}:\d{1,2}(?:[.:]\d{1,3})?>/g, '').trim();
+    if (stamps.length) for (const s of stamps) timed.push({ t: +s[1] * 60 + parseFloat(s[2].replace(':', '.')), text: txt });
+    else plain.push(txt);
+  }
+  if (timed.length >= 2) {
+    return { synced: true, lines: timed.map((l) => ({ ...l, t: Math.max(0, l.t - offset) })).sort((a, b) => a.t - b.t) };
+  }
+  const lines = plain.filter((l, i, a) => l || (i > 0 && a[i - 1])).map((text) => ({ t: null, text }));
+  return lines.some((l) => l.text) ? { synced: false, lines } : null;
+}
+
+let lyricsOpen = false;
+let lyricsFor = null;
+let lyricsParsed = null;
+let lyricsIdx = -1;
+let lyricsUserScroll = 0;
+let lyricsRaf = 0;
+
+function setLyricsMode(on) {
+  lyricsOpen = on;
+  $('#np').classList.toggle('lyrics-on', on);
+  npEls['lyrics-btn']?.forEach((b) => b.classList.toggle('on', on));
+  if (on) { renderLyrics(true); startLyricsLoop(); } else cancelAnimationFrame(lyricsRaf);
+}
+function renderLyrics(force = false) {
+  const box = $('#np-lyrics');
+  const t = getT(curId);
+  if (!box || (!force && lyricsFor === curId)) return;
+  lyricsFor = curId;
+  lyricsIdx = -1;
+  lyricsParsed = t && !t.live ? parseLyrics(t.lyrics) : null;
+  if (!t) { box.innerHTML = ''; return; }
+  if (t.live) { box.innerHTML = '<div class="ly-empty"><p>Beim Live-Radio gibt es keine Songtexte.</p></div>'; return; }
+  if (!lyricsParsed) {
+    box.innerHTML = `<div class="ly-empty">
+      <p class="ly-empty-title">Kein Songtext gespeichert</p>
+      <p>Klang zeigt Songtexte aus deinen Dateien oder aus einer .lrc-Datei mit dem gleichen Namen wie der Song. Mit Zeitstempeln wie [01:23.45] laufen sie live mit.</p>
+      <div class="btns"><button class="btn btn-accent" data-action="lyrics-edit">${icon('edit')}Songtext einfügen</button><button class="btn" data-action="lyrics-file">${icon('upload')}.lrc-Datei laden</button></div>
+    </div>`;
+    return;
+  }
+  const { synced, lines } = lyricsParsed;
+  box.innerHTML = `<div class="ly-lines ${synced ? 'synced' : ''}">${lines.map((l, i) => l.text
+    ? `<p class="ly-line" data-i="${i}" ${synced ? `role="button" tabindex="0" data-t="${l.t}"` : ''}>${esc(l.text)}</p>`
+    : `<p class="ly-gap" data-i="${i}" aria-hidden="true">${synced ? '♪' : ''}</p>`).join('')}</div>
+    <div class="ly-foot">${synced ? '' : '<span>Nicht synchronisiert · </span>'}<button class="link-sm" data-action="lyrics-edit">Bearbeiten</button></div>`;
+  box.scrollTop = 0;
+  syncLyrics(true);
+}
+function syncLyrics(jump = false) {
+  if (!lyricsOpen || !lyricsParsed?.synced) return;
+  const now = (audio.currentTime || 0) + 0.25;
+  const lines = lyricsParsed.lines;
+  let i = -1;
+  for (let k = 0; k < lines.length; k++) { if (lines[k].t <= now) i = k; else break; }
+  if (i === lyricsIdx && !jump) return;
+  lyricsIdx = i;
+  const box = $('#np-lyrics');
+  box.querySelectorAll('.ly-line.on, .ly-gap.on').forEach((e) => e.classList.remove('on'));
+  box.querySelectorAll('[data-i]').forEach((e) => e.classList.toggle('past', +e.dataset.i < i));
+  const el = box.querySelector(`[data-i="${i}"]`);
+  if (el) el.classList.add('on');
+  if (Date.now() - lyricsUserScroll > 4000) {
+    const target = el ? el.offsetTop - box.clientHeight * 0.38 : 0;
+    box.scrollTo({ top: Math.max(0, target), behavior: jump || matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' });
+  }
+}
+function startLyricsLoop() {
+  cancelAnimationFrame(lyricsRaf);
+  const tick = () => { syncLyrics(); if (lyricsOpen) lyricsRaf = requestAnimationFrame(tick); };
+  lyricsRaf = requestAnimationFrame(tick);
+}
+async function editLyrics(id = curId) {
+  const t = getT(id);
+  if (!t || t.live) return;
+  const r = await openDialog({
+    title: 'Songtext',
+    body: `<label class="field"><span>Text oder LRC mit Zeitstempeln, z. B. [00:12.50] Erste Zeile</span><textarea name="text" rows="12" spellcheck="false" placeholder="[00:12.50] …">${esc(t.lyrics || '')}</textarea></label>`,
+    buttons: [{ label: 'Abbrechen' }, { label: 'Speichern', primary: true, value: 'ok' }],
+  });
+  if (!r) return;
+  await saveLyrics(id, r.data.text || '');
+}
+async function saveLyrics(id, text) {
+  const t = getT(id);
+  if (!t) return;
+  t.lyrics = text.trim();
+  if (t.remote && !S.tracks.has(id)) await ensureSaved([id]);
+  else await db.put('tracks', t);
+  toast(t.lyrics ? 'Songtext gespeichert' : 'Songtext entfernt');
+  if (id === curId) renderLyrics(true);
+}
+
+/* =========================================================
+   Farbe & Live-Cover
+   ========================================================= */
+const liveCoverOn = () => ls.get('klang-live', true);
+function setAccent(name) {
+  ls.set('klang-accent', name);
+  applyAccent(name);
+  $$('.swatch').forEach((s) => s.classList.toggle('on', s.dataset.name === name));
+}
+function applyLiveCover() {
+  $('#np').classList.toggle('live-on', liveCoverOn());
+}
+function colorMenu(anchor) {
+  const cur = ls.get('klang-accent', 'Koralle');
+  const live = liveCoverOn();
+  openMenu([
+    { header: '<div><b>Farbe &amp; Live-Cover</b><span>Die Farbe gilt für Play, Fortschritt und Score-Bug</span></div>' },
+    ...ACCENTS.map((a) => ({ label: a.name, swatch: a.a, checked: a.name === cur, fn: () => { setAccent(a.name); toast(`Farbe: ${a.name}`, 1400); } })),
+    { sep: true },
+    { label: live ? 'Live-Cover ausschalten' : 'Live-Cover einschalten', icon: 'sparkle', checked: live, fn: () => { ls.set('klang-live', !live); applyLiveCover(); toast(live ? 'Live-Cover aus' : 'Live-Cover an', 1400); } },
+  ], anchor);
+}
+
+/* =========================================================
    Warteschlange
    ========================================================= */
 function renderQueue() {
@@ -867,7 +1011,15 @@ let importing = false;
 async function importItems(items) {
   if (importing) { toast('Import läuft bereits …'); return []; }
   const audioItems = items.filter((x) => isAudio(x.file));
-  if (!audioItems.length) { toast('Keine Audiodateien gefunden.'); return []; }
+  // Songtexte (.lrc) gehören zum Song mit gleichem Dateinamen
+  const baseKey = (p) => p.replace(/\.[^./]+$/, '').toLowerCase();
+  const lrcMap = new Map();
+  for (const x of items) if (/\.lrc$/i.test(x.file.name)) lrcMap.set(baseKey(x.path), x.file);
+  if (!audioItems.length) {
+    if (lrcMap.size) { await attachLyricsFiles(lrcMap); return []; }
+    toast('Keine Audiodateien gefunden.');
+    return [];
+  }
   importing = true;
 
   // Cover-Bilder aus Ordnern (cover.jpg, folder.jpg …)
@@ -905,8 +1057,12 @@ async function importItems(items) {
         if (src) cover = { id: coverKey, blob: await makeCover(src) };
       }
       const type = file.type || guessType(file.name);
+      let lyrics = tags.lyrics;
+      const lrc = lrcMap.get(baseKey(path));
+      if (lrc) { try { lyrics = (await lrc.text()).trim() || lyrics; } catch { /* */ } }
       const track = {
         id,
+        lyrics,
         title: tags.title, artist: tags.artist, album, albumArtist: tags.albumArtist,
         year: tags.year, genre: tags.genre, trackNo: tags.trackNo, discNo: tags.discNo,
         duration: await getDuration(file),
@@ -938,6 +1094,21 @@ async function importItems(items) {
   toast(msg, 4000);
   if (added && navigator.storage?.persist) navigator.storage.persist().catch(() => {});
   return ids;
+}
+// Nur .lrc-Dateien gewählt: den vorhandenen Songs mit gleichem Dateinamen zuordnen
+async function attachLyricsFiles(lrcMap) {
+  const byName = new Map();
+  for (const t of S.tracks.values()) if (t.fileName) byName.set(t.fileName.replace(/\.[^.]+$/, '').toLowerCase(), t);
+  let n = 0;
+  for (const [key, file] of lrcMap) {
+    const t = byName.get(key.split('/').pop());
+    if (!t) continue;
+    t.lyrics = (await file.text()).trim();
+    await db.put('tracks', t);
+    n++;
+  }
+  toast(n ? `${plural(n, 'Songtext', 'Songtexte')} zugeordnet` : 'Kein passender Song gefunden. Die .lrc-Datei muss wie die Musikdatei heißen.', 4000);
+  if (n && overlays.includes('np')) renderLyrics(true);
 }
 function guessType(name) {
   const ext = name.split('.').pop().toLowerCase();
@@ -1240,7 +1411,9 @@ function trackMenu(id, anchor, ctx = {}) {
       items.push({ label: 'Aus dieser Playlist entfernen', icon: 'x', fn: () => removeFromPlaylist(p.id, ctx.index) });
     }
   }
-  if (!t.remote) items.push({ sep: true }, { label: 'Infos bearbeiten', icon: 'edit', fn: () => editTrack(id) });
+  items.push({ sep: true }, { label: t.lyrics ? 'Songtext bearbeiten' : 'Songtext hinzufügen', icon: 'lyrics', fn: () => editLyrics(id) });
+  if (ctx.np) items.push({ label: 'Farbe & Live-Cover', icon: 'palette', fn: () => colorMenu(anchor) });
+  if (!t.remote) items.push({ label: 'Infos bearbeiten', icon: 'edit', fn: () => editTrack(id) });
   if (S.tracks.has(id)) {
     if (t.remote) items.push({ sep: true });
     items.push({ label: 'Aus Bibliothek löschen', icon: 'trash', danger: true, fn: () => deleteTracks([id]) });
@@ -1414,7 +1587,7 @@ function discTabs(active) {
   return `<div class="chips m-only">${[['discover', 'Musik'], ['radio', 'Radio']]
     .map(([k, l]) => `<a class="chip ${k === active ? 'on' : ''}" href="#/${k}">${l}</a>`).join('')}</div>`;
 }
-const settingsBtn = () => `<a class="icon-btn lg m-only" href="#/settings" aria-label="Einstellungen">${icon('settings')}</a>`;
+const settingsBtn = () => `<button class="icon-btn lg m-only" data-action="color-menu" aria-label="Farbe und Live-Cover">${icon('palette')}</button><a class="icon-btn lg m-only" href="#/settings" aria-label="Einstellungen">${icon('settings')}</a>`;
 
 function emptyLib() {
   const folder = finePointer() && 'webkitdirectory' in document.createElement('input');
@@ -1793,8 +1966,10 @@ views.settings = () => {
       <div id="storage-info" class="muted" style="font-size:14px">Wird berechnet …</div>
     </div>
     <div class="set-card">
-      <h2>Akzentfarbe</h2>
-      <div class="swatches" style="margin-top:12px">${ACCENTS.map((a) => `<button class="swatch ${a.name === accent ? 'on' : ''}" data-action="accent" data-name="${a.name}" title="${a.name}" aria-label="${a.name}" style="background:linear-gradient(135deg,${a.a},${a.b})"></button>`).join('')}</div>
+      <h2>Farbe &amp; Live-Cover</h2>
+      <p>Die Farbe gilt für Play-Knöpfe, Fortschritt und den Score-Bug im Player.</p>
+      <div class="swatches">${ACCENTS.map((a) => `<button class="swatch ${a.name === accent ? 'on' : ''}" data-action="accent" data-name="${a.name}" title="${a.name}" aria-label="${a.name}" style="background:${a.a}"></button>`).join('')}</div>
+      <div class="set-row" style="margin-top:14px;border-top:1px solid var(--line)"><div class="lbl">Live-Cover<small>Bewegtes Cover-Bild hinter dem Vollbild-Player</small></div><button class="btn btn-sm" data-action="toggle-live">${liveCoverOn() ? 'An' : 'Aus'}</button></div>
     </div>
     <div class="set-card">
       <h2>App installieren</h2>
@@ -1816,6 +1991,7 @@ views.settings = () => {
         <kbd>R</kbd><span>Wiederholen</span>
         <kbd>L</kbd><span>Aktuellen Titel als Favorit</span>
         <kbd>Q</kbd><span>Warteschlange</span>
+        <kbd>T</kbd><span>Songtext ein/aus</span>
         <kbd>Strg + K</kbd><span>Suchen</span>
       </div>
     </div>` : ''}
@@ -1945,7 +2121,16 @@ const actions = {
     else if (t.artistId) go('oartist', t.artistId);
     else go('artist', t.artist);
   },
-  'np-menu': (el) => { if (curId) trackMenu(curId, el); },
+  'np-menu': (el) => { if (curId) trackMenu(curId, el, { np: true }); },
+  'color-menu': (el) => colorMenu(el),
+  'open-lyrics': () => { if (!curId) return; openOverlay('np'); setLyricsMode(true); },
+  'toggle-lyrics': () => setLyricsMode(!lyricsOpen),
+  'lyrics-edit': () => editLyrics(),
+  'lyrics-file': async () => {
+    const id = curId;
+    const f = await pickFile('#lrc-input');
+    if (f && id) await saveLyrics(id, await f.text());
+  },
   fav: (el) => { const id = el.closest('[data-id]').dataset.id; setFav(id, !getT(id)?.fav); },
   'track-menu': (el) => { const row = el.closest('.row'); trackMenu(row.dataset.id, el, rowCtx(row)); },
   'play-list': (el) => { const L = listOf(el); if (L) playIds(L.ids, 0, { source: L.opts.source }); },
@@ -1979,7 +2164,8 @@ const actions = {
   'album-menu': (el) => albumMenu(el.dataset.key, el),
   'playlist-menu': (el) => playlistMenu(el.dataset.id, el),
   'new-playlist': async () => { const p = await newPlaylistFlow(); if (p) go('playlist', p.id); },
-  accent: (el) => { ls.set('klang-accent', el.dataset.name); applyAccent(el.dataset.name); $$('.swatch').forEach((s) => s.classList.toggle('on', s === el)); },
+  accent: (el) => setAccent(el.dataset.name),
+  'toggle-live': (el) => { const on = !liveCoverOn(); ls.set('klang-live', on); applyLiveCover(); el.textContent = on ? 'An' : 'Aus'; },
   persist: async () => {
     const ok = await navigator.storage?.persist?.();
     toast(ok ? 'Dauerhafter Speicher aktiviert' : 'Der Browser hat abgelehnt. Installiere Klang als App, dann klappt es meist.', 4000);
@@ -2015,6 +2201,14 @@ function setupEvents() {
       e.preventDefault();
       e.stopPropagation();
       actions[a.dataset.action]?.(a, e);
+      return;
+    }
+    const ly = e.target.closest('.ly-line[data-t]');
+    if (ly) {
+      audio.currentTime = +ly.dataset.t;
+      lyricsUserScroll = 0;
+      if (audio.paused) togglePlay();
+      syncLyrics(true);
       return;
     }
     const q = e.target.closest('.q-row[data-qi]');
@@ -2166,15 +2360,21 @@ function setupEvents() {
     else if (k === 'r' || k === 'R') cycleRepeat();
     else if (k === 'l' || k === 'L') actions['fav-current']();
     else if (k === 'q' || k === 'Q') actions.queue();
+    else if (k === 't' || k === 'T') { if (overlays.includes('np')) setLyricsMode(!lyricsOpen); else actions['open-lyrics'](); }
     else if (k === '/') go('search');
     else handled = false;
     if (handled) e.preventDefault();
   });
 
+  // Wer im Songtext selbst scrollt, wird 4 Sekunden nicht automatisch zurückgezogen
+  const lyBox = $('#np-lyrics');
+  ['wheel', 'touchmove'].forEach((ev) => lyBox.addEventListener(ev, () => { lyricsUserScroll = Date.now(); }, { passive: true }));
+  lyBox.addEventListener('keydown', (e) => { if (e.key === 'Enter' && e.target.matches('.ly-line[data-t]')) e.target.click(); });
+
   // Vollbild-Player nach unten wischen zum Schließen
   let ty = null;
   const np = $('#np');
-  np.addEventListener('touchstart', (e) => { ty = e.target.closest('.range, button') ? null : e.touches[0].clientY; }, { passive: true });
+  np.addEventListener('touchstart', (e) => { ty = e.target.closest('.range, button, .np-lyrics') ? null : e.touches[0].clientY; }, { passive: true });
   np.addEventListener('touchmove', (e) => {
     if (ty == null) return;
     const dy = e.touches[0].clientY - ty;
@@ -2234,6 +2434,7 @@ async function init() {
   hydrateIcons(document);
   applyAccent(ls.get('klang-accent', 'Koralle'));
   cacheNpEls();
+  applyLiveCover();
   updateVolumeUI();
   updateModeButtons();
   updatePlayState();
