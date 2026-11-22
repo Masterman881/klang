@@ -64,6 +64,8 @@ const S = {
 // Nicht gespeicherte Online-Titel leben nur hier. Gespeicherte (Favorit/Playlist) stehen zusätzlich in S.tracks.
 const remote = new Map();
 const getT = (id) => S.tracks.get(id) || remote.get(id);
+// Online = Audius/Radio. Songs aus dem lokalen Musik-Ordner (remote: 'server') zählen als eigene Musik.
+const isOnline = (t) => !!t?.remote && t.remote !== 'server';
 const hasT = (id) => S.tracks.has(id) || remote.has(id);
 function adopt(list) {
   return list.map((t) => {
@@ -1176,7 +1178,7 @@ async function setFav(id, val) {
   t.favAt = val ? Date.now() : 0;
   if (t.remote && val && !S.tracks.has(id)) { S.tracks.set(id, t); invalidate(); }
   if (S.tracks.has(id)) {
-    if (!val && t.remote && !inPlaylist(id)) {
+    if (!val && isOnline(t) && !inPlaylist(id)) {
       // Online-Titel ohne Favorit/Playlist wieder aus der Bibliothek nehmen
       S.tracks.delete(id);
       remote.set(id, t);
@@ -1420,7 +1422,7 @@ function trackMenu(id, anchor, ctx = {}) {
     { label: t.fav ? 'Aus Favoriten entfernen' : 'Zu Favoriten hinzufügen', icon: t.fav ? 'heart-fill' : 'heart', fn: () => setFav(id, !t.fav) },
     { sep: true },
   ];
-  if (t.remote) {
+  if (isOnline(t)) {
     if (t.artistId) items.push({ label: 'Zum Künstler', icon: 'user', fn: () => go('oartist', t.artistId) });
     if (t.permalink) items.push({ label: 'Auf Audius öffnen', icon: 'external', fn: () => window.open(t.permalink, '_blank', 'noopener') });
   } else {
@@ -1438,9 +1440,9 @@ function trackMenu(id, anchor, ctx = {}) {
   }
   items.push({ sep: true }, { label: t.lyrics ? 'Songtext bearbeiten' : 'Songtext hinzufügen', icon: 'lyrics', fn: () => editLyrics(id) });
   if (ctx.np) items.push({ label: 'Farbe & Live-Cover', icon: 'palette', fn: () => colorMenu(anchor) });
-  if (!t.remote) items.push({ label: 'Infos bearbeiten', icon: 'edit', fn: () => editTrack(id) });
+  if (!isOnline(t)) items.push({ label: 'Infos bearbeiten', icon: 'edit', fn: () => editTrack(id) });
   if (S.tracks.has(id)) {
-    if (t.remote) items.push({ sep: true });
+    if (isOnline(t)) items.push({ sep: true });
     items.push({ label: 'Aus Bibliothek löschen', icon: 'trash', danger: true, fn: () => deleteTracks([id]) });
   }
   openMenu(items, anchor);
@@ -1486,7 +1488,7 @@ function regList(ids, opts = {}) { const k = 'l' + listSeq++; lists[k] = { ids, 
 function listEl(k, head = true) {
   const o = lists[k].opts;
   const ids = lists[k].ids;
-  const online = ids.length && ids.every((id) => getT(id)?.remote);
+  const online = ids.length && ids.every((id) => isOnline(getT(id)));
   const h = head && !o.noHead ? `<div class="list-head">${o.rank ? '<span>Platz</span>' : ''}<span>${o.rank ? '' : '#'}</span><span>Titel</span>${o.numbers ? '' : `<span>${online ? 'Genre' : 'Album'}</span>`}<span></span><span class="r">${icon('clock')}</span><span></span></div>` : '';
   return `<div class="tracklist ${o.numbers ? 'no-album' : ''} ${o.rank ? 'ranked' : ''}" data-list="${k}">${h}</div>`;
 }
@@ -1499,7 +1501,7 @@ function rowHTML(t, i, key, o) {
   return `<div class="row" data-id="${t.id}" data-list="${key}" data-i="${i}"${o.playlist && finePointer() ? ' draggable="true"' : ''}>
     ${o.rank ? `<div class="row-rank ${i < 3 ? 'podium' : ''}">${i + 1}</div>` : ''}${lead}
     <div class="row-main"><div class="row-title">${o.numbers ? '' : eqHTML()}<span class="t">${esc(t.title)}</span></div><div class="row-sub">${esc(t.artist)}</div></div>
-    <div class="row-album">${esc(t.remote ? t.genre || 'Online' : t.album)}</div>
+    <div class="row-album">${esc(isOnline(t) ? t.genre || 'Online' : t.album)}</div>
     <button class="icon-btn row-fav ${t.fav ? 'on' : ''}" data-action="fav" aria-label="Favorit">${icon(t.fav ? 'heart-fill' : 'heart')}</button>
     <div class="row-dur">${fmt(t.duration)}</div>
     <button class="icon-btn row-more" data-action="track-menu" aria-label="Mehr Optionen">${icon('more')}</button>
@@ -2859,14 +2861,24 @@ function setupLaunchQueue() {
 async function loadServerLibrary(showToast = false) {
   let list;
   try {
-    const r = await fetch('/api/music');
-    if (!r.ok) return;
+    const r = await fetch('/api/music', { cache: 'no-store' });
+    if (!r.ok || !(r.headers.get('content-type') || '').includes('json')) throw new Error('kein Musik-Server');
     list = await r.json();
-  } catch { return; } // Server nicht verfügbar
+    if (!Array.isArray(list)) throw new Error('unerwartete Antwort');
+  } catch {
+    // Kein lokaler Klang-Server (z. B. auf der Online-Version): Knopf bleibt versteckt
+    if (showToast) toast('Der Musik-Ordner geht nur mit dem Klang-Server auf deinem PC („Klang starten.bat“).', 4500);
+    return;
+  }
+  $$('[data-server-lib]').forEach((b) => b.classList.remove('hidden'));
 
-  if (!list || !list.length) return;
+  if (!list.length) {
+    if (showToast) toast('Im Musik-Ordner (Downloads\\music) liegen noch keine Songs.', 4000);
+    return;
+  }
 
   let added = 0;
+  const fresh = [];
   for (const item of list) {
     const id = 'srv:' + item.url;
     if (S.tracks.has(id)) continue;
@@ -2888,14 +2900,17 @@ async function loadServerLibrary(showToast = false) {
       addedAt: Date.now(),
     };
     S.tracks.set(id, track);
-    try { await db.put('tracks', track); } catch { /* */ }
+    fresh.push(track);
     added++;
   }
+  if (fresh.length) { try { await db.putMany('tracks', fresh); } catch { /* */ } }
 
   if (added > 0) {
     invalidate();
     refresh();
     if (showToast) toast(`${plural(added, 'Titel', 'Titel')} aus Musik-Ordner geladen`, 3000);
+  } else if (showToast) {
+    toast(`Alles aktuell: ${plural(list.length, 'Song', 'Songs')} im Musik-Ordner`, 3000);
   }
 }
 

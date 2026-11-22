@@ -1,6 +1,6 @@
 // Service Worker: macht Klang offline-fähig und installierbar.
 // Bei Änderungen an der App die Versionsnummer erhöhen.
-const CACHE = 'klang-v6';
+const CACHE = 'klang-v7';
 const ASSETS = [
   './',
   'index.html',
@@ -45,10 +45,13 @@ self.addEventListener('fetch', (e) => {
   if (req.method !== 'GET') return;
   const url = new URL(req.url);
   if (url.origin !== self.location.origin) return;
+  // Musik-Ordner vom lokalen Server: Liste immer frisch, Audio direkt streamen (Teil-Antworten,
+  // große Dateien) – beides nie über den Cache leiten.
+  if (url.pathname.startsWith('/api/') || url.pathname.startsWith('/music/') || req.headers.has('range')) return;
 
   const network = fetch(req)
     .then(async (res) => {
-      if (res && res.ok && res.type === 'basic') {
+      if (res && res.status === 200 && res.type === 'basic') {
         const c = await caches.open(CACHE);
         await c.put(req, res.clone());
       }
