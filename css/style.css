@@ -633,6 +633,11 @@ body.np-open .pb-art .cover { view-transition-name: none; }
 .np-src span { display: block; font-weight: 600; font-size: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .np-art { flex: 1; min-height: 0; display: grid; place-items: center; padding: 24px 0; }
 .np-art .cover { width: min(100%, 50vh); border-radius: var(--r); box-shadow: 0 40px 100px rgba(0, 0, 0, .7); transition: transform .4s var(--ease); }
+/* Cover nie größer als der freie Platz (iPhone-Safari rechnet vh mit eingeklappter Leiste und lief sonst über Kopf und Titel) */
+@supports (width: 1cqh) {
+  .np-art { container-type: size; }
+  .np-art .cover { width: min(100cqw, 100cqh, 560px); }
+}
 body.np-open #np:not(.lyrics-on) .np-art .cover { view-transition-name: np-cover; }
 body:not(.is-playing) .np-art .cover { transform: scale(.95); }
 .np-meta { display: flex; align-items: center; gap: 14px; }
@@ -1038,7 +1043,8 @@ body.is-live [data-action="shuffle"], body.is-live [data-action="repeat"] { opac
   .actions-bar { gap: 10px; }
 
   .np-inner { padding-left: 20px; padding-right: 20px; }
-  .np-title { font-size: 32px; }
+  .np-art { padding: 18px 0; }
+  .np-title { font-size: 30px; line-height: 1.02; white-space: normal; overflow-wrap: anywhere; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; }
   .ly-line { font-size: 25px; }
   .np-extra .pill-btn { padding: 0 10px; }
   .np-live-img { filter: blur(44px) saturate(1.35) brightness(.72); }
