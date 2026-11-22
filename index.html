@@ -25,6 +25,7 @@
   <script src="js/vendor/lenis.min.js" defer></script>
 </head>
 <body>
+  <div id="splash" aria-hidden="true"><div class="sp-mark"><img src="icons/icon.svg" alt=""><b>VERS</b></div></div>
   <div id="app">
     <aside id="sidebar">
       <a class="brand" href="#/"><img src="icons/icon.svg" alt=""><span><b>VERS</b><small>MUSIK</small></span></a>
@@ -91,6 +92,7 @@
         <button class="icon-btn" data-action="open-lyrics" title="Songtext (T)"><i data-icon="lyrics"></i></button>
         <button class="icon-btn" data-action="sleep" data-np="sleep" title="Sleep-Timer"><i data-icon="moon"></i></button>
         <button class="icon-btn" data-action="queue" data-np="queue-btn" title="Warteschlange (Q)"><i data-icon="queue"></i></button>
+        <button class="icon-btn" data-action="output" title="Ausgabegerät (Bluetooth, AirPlay)" aria-label="Ausgabegerät"><i data-icon="airplay"></i></button>
         <button class="icon-btn" data-action="mute" data-np="vol-icon" title="Stumm (M)"><i data-icon="volume"></i></button>
         <input type="range" class="range vol" min="0" max="100" value="100" data-vol aria-label="Lautstärke">
         <button class="icon-btn" data-action="open-np" title="Vollbild"><i data-icon="expand"></i></button>
@@ -99,10 +101,10 @@
 
     <nav id="bottomnav">
       <a href="#/" data-nav="home"><i data-icon="home"></i><span>Start</span></a>
-      <a href="#/discover" data-nav="discover-m"><i data-icon="compass"></i><span>Entdecken</span></a>
       <a href="#/search" data-nav="search"><i data-icon="search"></i><span>Suchen</span></a>
       <a href="#/songs" data-nav="library"><i data-icon="library"></i><span>Bibliothek</span></a>
-      <a href="#/playlists" data-nav="playlists"><i data-icon="playlist"></i><span>Playlists</span></a>
+      <a href="#/stats" data-nav="stats"><i data-icon="stats"></i><span>Statistik</span></a>
+      <button type="button" data-action="drawer" data-nav="more"><i data-icon="menu"></i><span>Mehr</span></button>
     </nav>
   </div>
 
@@ -114,6 +116,7 @@
         <button class="icon-btn lg" data-action="close-np" aria-label="Schließen"><i data-icon="chevron-down"></i></button>
         <div class="np-src"><small>Wiedergabe aus</small><span data-np="source">Bibliothek</span></div>
         <span class="np-head-r">
+          <button class="icon-btn lg" data-action="output" aria-label="Ausgabegerät: AirPods, Bluetooth, AirPlay"><i data-icon="airplay"></i></button>
           <button class="icon-btn lg" data-action="eq" aria-label="Equalizer"><i data-icon="equalizer"></i></button>
           <button class="icon-btn lg" data-action="np-menu" aria-label="Mehr"><i data-icon="more"></i></button>
         </span>
@@ -157,6 +160,7 @@
     <div id="queue-list"></div>
   </aside>
 
+  <div id="drawer-layer"><div class="drawer-backdrop" data-action="drawer-close"></div><nav id="drawer" aria-label="Menü"></nav></div>
   <section id="auth" class="auth" hidden aria-label="Anmeldung"></section>
   <div id="menu-layer"></div>
   <div id="dialog-layer"></div>

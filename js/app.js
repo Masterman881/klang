@@ -442,6 +442,10 @@ function progressToast() {
       el.querySelector('.t-sub').textContent = sub || '';
       el.querySelector('.meter div').style.width = `${(i / n) * 100}%`;
     },
+    text(main, p) {
+      el.querySelector('.t-main').textContent = main;
+      el.querySelector('.meter div').style.width = `${Math.round(p * 100)}%`;
+    },
     close() { el.classList.add('out'); setTimeout(() => el.remove(), 300); },
   };
 }
@@ -566,6 +570,7 @@ function setOverlayClass(name, on) {
     if (!on) cancelAnimationFrame(lyricsRaf);
   }
   if (name === 'queue') { $('#queue').classList.toggle('open', on); $('#queue-backdrop').classList.toggle('open', on); }
+  if (name === 'drawer') { if (on) renderDrawer(); $('#drawer-layer').classList.toggle('open', on); document.body.classList.toggle('drawer-open', on); }
 }
 window.addEventListener('popstate', () => {
   const top = overlays.pop();
@@ -643,6 +648,11 @@ function clearEl(el) {
   applyVol(el);
 }
 async function sourceFor(t) {
+  if (t.remote && isDl(t.id)) {
+    const rec = await db.get('audio', t.id).catch(() => null);
+    if (rec) { const u = URL.createObjectURL(rec.blob); return { src: u, obj: u }; }
+  }
+  if (t.remote && memPre.id === t.id && memPre.url) { const u = memPre.url; memPre.id = memPre.url = null; return { src: u, obj: u }; }
   if (t.remote) return { src: t.remote === 'server' ? withKey(encPath(t.streamUrl)) : t.remote === 'cloud' ? cloudSrc(t.streamUrl) : t.streamUrl };
   let rec = null;
   try { rec = await db.get('audio', t.id); } catch { /* */ }
@@ -738,12 +748,14 @@ function checkTransition() {
 }
 
 // ---- Zählen: echte Hörzeit, „gespielt“ erst nach 30 s bzw. halber Länge ----
-let listened = 0, credited = false, lastPos = null;
+let listened = 0, credited = false, lastPos = null, preTimer = null;
 function onTrackStart(t) {
   t.lastPlayed = Date.now();
   if (S.tracks.has(t.id)) { db.put('tracks', t); _albums = null; }
   listened = 0; credited = false; lastPos = null;
   topUpSmart();
+  clearTimeout(preTimer);
+  preTimer = setTimeout(prefetchNext, 2500);
 }
 function listenTick() {
   const c = audio.currentTime || 0;
@@ -1012,11 +1024,12 @@ document.addEventListener('visibilitychange', () => { if (document.hidden) saveS
 // ---- Audio-Events (für alle Abspieler, wirken nur beim aktiven) ----
 function bindAudio(el) {
   const on = (type, fn) => el.addEventListener(type, (e) => { if (el === audio) fn(e); });
-  on('play', () => { updatePlayState(); sendPresence(); });
-  on('pause', () => { updatePlayState(); saveState(); sendPresence(); });
+  on('play', () => { updatePlayState(); sendPresence(); updatePosState(); });
+  on('pause', () => { updatePlayState(); saveState(); sendPresence(); updatePosState(); });
+  on('durationchange', updatePosState);
   on('playing', () => { errorStreak = 0; lastPos = audio.currentTime; });
   on('seeking', () => { lastPos = null; });
-  on('seeked', () => { lastPos = audio.currentTime; sendPresence(); });
+  on('seeked', () => { lastPos = audio.currentTime; sendPresence(); updatePosState(); });
   on('timeupdate', () => {
     updateProgress();
     listenTick();
@@ -1387,8 +1400,9 @@ function setupMediaSession() {
   h('previoustrack', prev);
   h('nexttrack', () => next());
   h('seekto', (d) => { if (d.fastSeek && 'fastSeek' in audio) audio.fastSeek(d.seekTime); else audio.currentTime = d.seekTime; updatePosState(); });
-  h('seekbackward', (d) => { audio.currentTime = Math.max(0, audio.currentTime - (d.seekOffset || 10)); updatePosState(); });
-  h('seekforward', (d) => { audio.currentTime = Math.min(audio.duration || 0, audio.currentTime + (d.seekOffset || 10)); updatePosState(); });
+  // Keine ±10-Sekunden-Knöpfe: dann zeigt der Sperrbildschirm „Zurück“ und „Weiter“
+  h('seekbackward', null);
+  h('seekforward', null);
 }
 const artCache = new Map();
 async function artworkDataUrl(coverId) {
@@ -1411,15 +1425,20 @@ async function updateMediaSession() {
   navigator.mediaSession.metadata = new MediaMetadata({
     title: t.title, artist: t.artist, album: t.album,
     artwork: art
-      ? [{ src: art, sizes: t.remote ? '480x480' : '600x600', ...(t.remote ? {} : { type: 'image/jpeg' }) }]
+      ? (art.startsWith('data:') ? ['96x96', '256x256', '512x512', '600x600'].map((sizes) => ({ src: art, sizes, type: 'image/jpeg' })) : [{ src: art, sizes: '480x480' }])
       : [{ src: 'icons/icon-512.png', sizes: '512x512', type: 'image/png' }],
   });
+  updatePosState();
 }
 function updatePosState() {
   try {
-    if ('mediaSession' in navigator && Number.isFinite(audio.duration) && audio.duration > 0) {
-      navigator.mediaSession.setPositionState({ duration: audio.duration, position: Math.min(audio.currentTime, audio.duration), playbackRate: audio.playbackRate || 1 });
-    }
+    if (!('mediaSession' in navigator)) return;
+    const t = getT(curId);
+    if (!t || t.live) { navigator.mediaSession.setPositionState?.(); return; }
+    const d = Number.isFinite(audio.duration) && audio.duration > 0 ? audio.duration : t.duration || 0;
+    if (!d) return;
+    const pos = deferred ? Math.min(deferred.startAt || 0, d) : Math.min(audio.currentTime || 0, d);
+    navigator.mediaSession.setPositionState({ duration: d, position: pos, playbackRate: audio.paused ? 1 : audio.playbackRate || 1 });
   } catch { /* */ }
 }
 
@@ -2039,6 +2058,7 @@ async function setFav(id, val) {
   }
   t.fav = val;
   t.favAt = val ? Date.now() : 0;
+  if (val && PB.autoDlFavs && canDownload(t)) setTimeout(() => downloadTracks([t.id]), 300);
   if (t.remote && val && !S.tracks.has(id)) { S.tracks.set(id, t); invalidate(); }
   if (S.tracks.has(id)) {
     if (!val && isOnline(t) && !inPlaylist(id)) {
@@ -2282,6 +2302,7 @@ function trackMenu(id, anchor, ctx = {}) {
     header,
     { label: 'Als Nächstes abspielen', icon: 'play-next', fn: () => playNext([id]) },
     { label: 'Zur Warteschlange hinzufügen', icon: 'list-plus', fn: () => addToQueue([id]) },
+    ...(canDownload(t) ? [isDl(id) ? { label: 'Download entfernen', icon: 'dl-done', fn: () => removeDownloads([id]).then(() => toast('Download entfernt')) } : { label: 'Herunterladen (offline)', icon: 'download', fn: () => downloadTracks([id]) }] : []),
     { label: 'Zu Playlist hinzufügen', icon: 'playlist', fn: () => pickPlaylist([id]) },
     { label: t.fav ? 'Aus Favoriten entfernen' : 'Zu Favoriten hinzufügen', icon: t.fav ? 'heart-fill' : 'heart', fn: () => setFav(id, !t.fav) },
     { sep: true },
@@ -2387,6 +2408,7 @@ function mountLists(root) {
       n = end;
       hydrateCovers(el);
       markPlaying(el);
+      el.querySelectorAll('.row[data-id]').forEach((r) => { if (dlIds.has(r.dataset.id)) r.classList.add('is-dl'); });
       if (n < L.ids.length) {
         const s = document.createElement('div');
         s.className = 'sentinel';
@@ -2505,14 +2527,14 @@ function pageHead(title, sub = '', actions = '') {
   return `<header class="page-head"><div><h1>${title}</h1>${sub ? `<p class="muted">${sub}</p>` : ''}</div><div class="head-actions">${actions}</div></header>`;
 }
 function libTabs(active) {
-  return `<div class="chips m-only">${[['songs', 'Titel'], ['albums', 'Alben'], ['artists', 'Künstler'], ['favorites', 'Favoriten'], ['stats', 'Statistik']]
+  return `<div class="chips m-only">${[['songs', 'Titel'], ['albums', 'Alben'], ['artists', 'Künstler'], ['favorites', 'Favoriten'], ['playlists', 'Playlists'], ['downloads', 'Downloads']]
     .map(([k, l]) => `<a class="chip ${k === active ? 'on' : ''}" href="#/${k}">${l}</a>`).join('')}</div>`;
 }
 function discTabs(active) {
   return `<div class="chips m-only">${[['discover', 'Musik'], ['radio', 'Radio']]
     .map(([k, l]) => `<a class="chip ${k === active ? 'on' : ''}" href="#/${k}">${l}</a>`).join('')}</div>`;
 }
-const settingsBtn = () => `${auth.current() ? `<a class="m-only profile-btn" href="#/profil" aria-label="Mein Profil">${avatarHTML(auth.current(), 'sm')}</a>` : ''}<button class="icon-btn lg m-only" data-action="color-menu" aria-label="Farbe und Live-Cover">${icon('palette')}</button><a class="icon-btn lg m-only" href="#/settings" aria-label="Einstellungen">${icon('settings')}</a>`;
+const settingsBtn = () => `<button class="m-only profile-btn" data-action="drawer" aria-label="Menü öffnen">${auth.current() ? avatarHTML(auth.current(), 'sm') : icon('menu')}</button>`;
 
 function emptyLib() {
   const folder = finePointer() && 'webkitdirectory' in document.createElement('input');
@@ -2584,7 +2606,12 @@ views.home = () => {
     ...S.playlists.slice(-2).reverse().map((p) => `<a class="tile" href="#/playlist/${p.id}">${playlistCover(p, 'mini').replace('class="cover', 'class="cover tile-art')}<span class="tile-label"><span>${esc(p.name)}</span><small>Playlist</small></span></a>`),
   ].join('');
 
-  let html = feature + `<div class="tiles">${tiles}</div>`;
+  // Handy: eigene Musik zuerst, ruhiger Kopf statt großem Online-Karussell
+  const hr = new Date().getHours();
+  const hello = hr < 5 ? 'Gute Nacht' : hr < 11 ? 'Guten Morgen' : hr < 18 ? 'Hallo' : 'Guten Abend';
+  const me = auth.current();
+  const mHead = `<header class="m-home-head m-only"><div><small>${hello}${me ? ',' : ''}</small><h1>${esc(me?.display || 'VERS')}</h1></div>${settingsBtn()}</header>`;
+  let html = mHead + feature.replace('class="feature"', 'class="feature d-only"') + `<div class="tiles">${tiles}</div>`;
   if (recent.length) html += section('Weiterhören', '#/albums', `<div class="shelf">${recent.map(albumCard).join('')}</div>`);
   html += online.split('</section>')[0] + '</section>';
   if (top.length) { const k = regList(top.map((t) => t.id), { source: 'Meistgespielt', noHead: true }); html += section('Deine Top-Titel', '', listEl(k, false)); }
@@ -2900,7 +2927,8 @@ views.favorites = () => {
       <div class="hero-info"><h1>Favoriten</h1><p>Playlist · ${plural(ids.length, 'Titel', 'Titel')}</p></div>
     </div>`;
   if (!ids.length) return head + '<div class="empty-small">Noch keine Favoriten. Tippe bei einem Titel auf das Herz.</div>';
-  return head + `<div class="actions-bar">${playButtons(k)}</div>` + listEl(k);
+  const open = ids.filter((id) => canDownload(getT(id)) && !isDl(id)).length;
+  return head + `<div class="actions-bar">${playButtons(k)}<span style="flex:1"></span>${open ? `<button class="btn btn-sm" data-action="dl-favs" aria-label="Favoriten herunterladen">${icon('download')}<span>Alle laden (${open})</span></button>` : `<span class="dl-ok">${icon('dl-done')}Offline</span>`}</div>` + listEl(k);
 };
 
 views.playlists = () => {
@@ -3089,7 +3117,13 @@ views.settings = () => {
   const standalone = matchMedia('(display-mode: standalone)').matches || navigator.standalone;
   const lc = lyr.counts(tracks.filter((t) => !t.live));
   const motion = ls.get('klang-motion', 'full');
-  const nav = [['play', 'Wiedergabe'], ['look', 'Aussehen'], ['lib', 'Bibliothek'], ['offline', 'Offline'], ['discord', 'Discord'], ['data', 'Daten']];
+  const nav = [['play', 'Wiedergabe'], ['audio', 'Audio & Geräte'], ['offline', 'Downloads'], ['look', 'Aussehen'], ['lib', 'Bibliothek'], ['discord', 'Discord'], ['data', 'Konto & Daten']];
+  const ct = getT(curId);
+  const kbps = ct && ct.size && ct.duration ? Math.round((ct.size * 8) / ct.duration / 1000 / 8) * 8 : 0;
+  const ext = ct?.streamUrl ? (ct.streamUrl.match(/\.([a-z0-9]+)$/i)?.[1] || '').toUpperCase() : '';
+  const dlSize = [...dlIds].reduce((sum, id) => sum + (getT(id)?.size || 0), 0);
+  const favOpen = tracks.filter((t) => t.fav && canDownload(t) && !isDl(t.id)).length;
+  const outName = canAirPlay() ? 'AirPlay, AirPods und Bluetooth über das Apple-Menü' : canSink() ? 'Lautsprecher, Kopfhörer und Bluetooth-Geräte des PCs' : 'In den Bluetooth-Einstellungen des Geräts';
   return pageHead('Einstellungen') + `<nav class="set-nav chips" aria-label="Bereiche">${nav.map(([k, l]) => `<a class="chip" href="#set-${k}" data-action="set-jump" data-k="${k}">${l}</a>`).join('')}</nav>
   <div class="settings">
     <div class="set-card" id="set-play">
@@ -3113,6 +3147,15 @@ views.settings = () => {
         <kbd>Strg + K</kbd><span>Suchen</span>
         <kbd>Medientasten</kbd><span>Tastatur, Kopfhörer und Sperrbildschirm</span>
       </div></details>` : ''}
+    </div>
+
+    <div class="set-card" id="set-audio">
+      <h2>Audio &amp; Geräte</h2>
+      ${setRow('Qualität', `Immer die Originaldatei, ohne Umwandlung oder Komprimierung. Das ist die beste Qualität, die deine Songs haben.${kbps ? `<br>Aktueller Song: ${ext || 'Audio'}, ca. ${kbps} kbit/s` : ''}`, `<span class="q-badge">${icon('check')}Original</span>`)}
+      ${setRow('Ausgabegerät', outName, `<button class="btn btn-sm" data-action="output">${icon('airplay')}Wählen</button>`)}
+      ${setRow('AirPods &amp; Bluetooth', 'Kopfhörer und Boxen zuerst am Handy bzw. PC koppeln. Play, Pause und Weiter am Kopfhörer steuern VERS.', '')}
+      ${setRow('Alexa / Echo', 'Am Echo „Alexa, koppeln“ sagen, dann das Gerät in den Bluetooth-Einstellungen des Handys verbinden. VERS spielt dann darüber.', '')}
+      ${setRow('Sperrbildschirm', 'Cover, Titel, Künstler, Zeit und Vor/Zurück erscheinen automatisch auf dem Sperrbildschirm, im Kontrollzentrum und auf der Uhr.', '')}
     </div>
 
     <div class="set-card" id="set-look">
@@ -3150,9 +3193,13 @@ views.settings = () => {
     </div>` : ''}
 
     <div class="set-card" id="set-offline">
-      <h2>Offline &amp; Songtexte</h2>
+      <h2>Downloads &amp; Offline</h2>
+      ${setRow('Heruntergeladen', dlIds.size ? `${plural(dlIds.size, 'Song', 'Songs')} · ${fmtBytes(dlSize)} · inklusive Cover` : 'Noch nichts. Im ⋯-Menü eines Songs auf „Herunterladen“ tippen.', `<a class="btn btn-sm" href="#/downloads">${icon('download')}Ansehen</a>`)}
+      ${setRow('Favoriten offline', 'Neue Favoriten werden automatisch heruntergeladen', toggleBtn('pb-autodl', !!PB.autoDlFavs))}
+      ${favOpen ? setRow('Favoriten jetzt laden', `${plural(favOpen, 'Favorit fehlt', 'Favoriten fehlen')} noch`, `<button class="btn btn-sm btn-accent" data-action="dl-favs">${icon('download')}Laden</button>`) : ''}
       ${setRow('Songtexte', `${plural(lc.have, 'Songtext', 'Songtexte')} gespeichert${lc.open ? ` · ${lc.open} noch offen` : ''}${lc.miss ? ` · ${lc.miss} ohne Text` : ''}`, `<button class="btn btn-sm" data-action="lyrics-all" ${lc.open && navigator.onLine ? '' : 'disabled'}>${icon('download')}<span data-lyrics-progress>${lc.open ? 'Alle laden' : 'Vollständig'}</span></button>`)}
       ${setRow('Cover', 'Werden beim ersten Anzeigen gespeichert und gehen danach offline', `<button class="btn btn-sm" data-action="covers-all">${icon('download')}<span data-cover-progress>Alle laden</span></button>`)}
+      ${dlIds.size ? setRow('Downloads löschen', 'Gibt Speicher frei, die Songs bleiben in der Bibliothek', `<button class="btn btn-sm btn-danger" data-action="dl-clear">Löschen</button>`) : ''}
       <div id="storage-info" class="muted" style="font-size:14px;margin-top:10px">Wird berechnet …</div>
       ${size ? `<p class="muted small">Davon importierte Musik: ${fmtBytes(size)}</p>` : ''}
     </div>
@@ -3174,7 +3221,8 @@ views.settings = () => {
     </div>
 
     <div class="set-card" id="set-data">
-      <h2>Daten</h2>
+      <h2>Konto &amp; Daten</h2>
+      ${setRow('Profil', 'Bild, Name, Status, Profilfarbe, Passwort', `<a class="btn btn-sm" href="#/profil">${icon('user')}Profil öffnen</a>`)}
       ${setRow('Hörstatistik', `Seit ${new Date(stats.summary('all').since).toLocaleDateString('de')} · ${fmtMin(stats.summary('all').total)}`, `<div class="btn-row"><button class="btn btn-sm" data-action="stats-export">${icon('download')}Sichern</button><button class="btn btn-sm btn-danger" data-action="stats-reset">Zurücksetzen</button></div>`)}
       ${setRow('Gespeicherte Songtexte', 'Werden bei Bedarf neu geladen', `<button class="btn btn-sm" data-action="lyrics-clear">Löschen</button>`)}
       ${setRow('Bibliothek löschen', 'Entfernt Titel, Cover und Playlists von diesem Gerät. Deine Originaldateien bleiben.', `<button class="btn btn-sm btn-danger" data-action="wipe" ${tracks.length || S.playlists.length ? '' : 'disabled'}>${icon('trash')}Löschen</button>`)}
@@ -3463,36 +3511,49 @@ async function submitAuth(form) {
   render(true);
 }
 
+const PROFILE_COLORS = ['#e9b44c', '#ff6b4a', '#ff4d5e', '#f472b6', '#8b7bff', '#4f9dff', '#2dd4bf', '#4ade80'];
 views.profil = () => {
   const a = auth.current();
   if (!a) return notFound();
   const all = [...S.tracks.values()];
   const since = new Date(a.createdAt).toLocaleDateString('de', { month: 'long', year: 'numeric' });
   const genreOpts = GENRES.map(([k, l]) => `<option value="${k}" ${a.genre === k ? 'selected' : ''}>${k === 'all' ? 'Keins' : l}</option>`).join('');
-  return `<div class="hero profile-hero" style="--h:${hue(a.display)}">
-      <div class="avatar-wrap">${avatarHTML(a, 'xl')}<button class="avatar-edit" data-action="avatar-pick" aria-label="Profilbild ändern">${icon('image')}</button></div>
-      <div class="hero-info">
-        ${premiumBadge('lg')}
-        <h1>${esc(a.display)}</h1>
-        <p>${[`@${esc(a.name)}`, `Mitglied seit ${since}`, plural(all.length, 'Titel', 'Titel'), plural(S.playlists.length, 'Playlist', 'Playlists'), plural(all.filter((t) => t.fav).length, 'Favorit', 'Favoriten')].map((x) => `<span class="nowrap">${x}</span>`).join(' · ')}</p>
-        ${a.bio ? `<p class="profile-bio">${esc(a.bio)}</p>` : ''}
+  const color = a.color || 'var(--accent)';
+  const month = stats.summary('month');
+  const total = stats.summary('all');
+  const top = month.artists.slice(0, 6).map((x) => getArtists().get(x.key) || { name: x.name, coverId: artistPicId(x.name) });
+  const facts = [
+    [minutes(total.total).toLocaleString('de'), 'Minuten gehört'],
+    [all.filter((t) => t.fav).length.toLocaleString('de'), 'Favoriten'],
+    [S.playlists.length.toLocaleString('de'), 'Playlists'],
+    [dlIds.size.toLocaleString('de'), 'Downloads'],
+  ];
+  return `<div class="profile-card" style="--pc:${esc(color)}">
+      <div class="pc-banner"></div>
+      <div class="pc-body">
+        <div class="avatar-wrap">${avatarHTML(a, 'xl')}<button class="avatar-edit" data-action="avatar-pick" aria-label="Profilbild ändern">${icon('image')}</button></div>
+        <div class="pc-name">${premiumBadge('lg')}<h1>${esc(a.display)}</h1><p class="muted">@${esc(a.name)} · dabei seit ${since}</p>${a.bio ? `<p class="profile-bio">${esc(a.bio)}</p>` : ''}</div>
+        <a class="icon-btn lg pc-set" href="#/settings" aria-label="Einstellungen" title="Einstellungen">${icon('settings')}</a>
       </div>
+      <dl class="facts pc-facts">${facts.map(([v, l]) => `<div><dt>${v}</dt><dd>${l}</dd></div>`).join('')}</dl>
     </div>
-    <div class="settings">
-      <div class="set-card">
-        <h2>Profil</h2>
+    ${top.length ? section('Deine Top-Künstler diesen Monat', '#/stats', `<div class="peer-row">${top.map((p) => `<a class="peer" href="#/artist/${encodeURIComponent(p.name)}">${artistArt(p.name, p.coverId, 'peer-art')}<b>${esc(p.name)}</b></a>`).join('')}</div>`) : ''}
+    <div class="settings profile-edit">
+      <details class="set-card" ${a.display === a.name && !a.bio ? 'open' : ''}>
+        <summary><h2>Profil bearbeiten</h2>${icon('chevron-down')}</summary>
         <form data-form="profile" novalidate>
           <label class="field"><span>Anzeigename</span><input name="display" value="${esc(a.display)}" maxlength="32" autocomplete="nickname"></label>
           <label class="field"><span>Status</span><input name="bio" value="${esc(a.bio || '')}" maxlength="90" placeholder="Was hörst du gerade am liebsten?"></label>
           <label class="field"><span>Lieblingsgenre (startet Entdecken damit)</span><select class="select wide-select" name="genre">${genreOpts}</select></label>
+          <div class="field"><span>Profilfarbe</span><div class="swatches">${PROFILE_COLORS.map((c) => `<label class="swatch ${a.color === c ? 'on' : ''}" style="background:${c}"><input type="radio" name="color" value="${c}" ${a.color === c ? 'checked' : ''} aria-label="Farbe ${c}"></label>`).join('')}</div></div>
           <div class="btn-row"><button class="btn btn-accent" type="submit">${icon('check')}Speichern</button>
             <button class="btn" type="button" data-action="avatar-pick">${icon('image')}Profilbild ändern</button>
             ${a.avatar ? `<button class="btn" type="button" data-action="avatar-remove">${icon('x')}Bild entfernen</button>` : ''}</div>
         </form>
-      </div>
-      <div class="set-card">
-        <h2>Passwort ändern</h2>
-        <p>Für das Startkonto bitte ein eigenes Passwort setzen.</p>
+      </details>
+      <details class="set-card">
+        <summary><h2>Konto</h2>${icon('chevron-down')}</summary>
+        <p>Passwort ändern. Für das Startkonto bitte ein eigenes Passwort setzen.</p>
         <form data-form="password" novalidate>
           <label class="field"><span>Aktuelles Passwort</span><input name="old" type="password" autocomplete="current-password"><em class="field-err" data-err="old"></em></label>
           <div class="field-grid">
@@ -3501,12 +3562,9 @@ views.profil = () => {
           </div>
           <button class="btn btn-accent" type="submit">${icon('check')}Passwort speichern</button>
         </form>
-      </div>
-      <div class="set-card">
-        <h2>Abmelden</h2>
-        <p>Deine Musik, Playlists und Favoriten bleiben auf dem Gerät. Beim nächsten Öffnen fragt VERS wieder nach Name und Passwort.</p>
-        <button class="btn btn-danger" data-action="logout">${icon('logout')}Abmelden</button>
-      </div>
+        <div class="set-row" style="margin-top:16px"><div class="lbl">Abmelden<small>Musik, Playlists und Favoriten bleiben auf dem Gerät.</small></div><button class="btn btn-sm btn-danger" data-action="logout">${icon('logout')}Abmelden</button></div>
+      </details>
+      <a class="set-card set-link" href="#/settings">${icon('settings')}<span><b>Einstellungen</b><small>Wiedergabe, Audio &amp; Geräte, Downloads, Aussehen, Discord</small></span>${icon('chevron-right')}</a>
     </div>`;
 };
 
@@ -3574,7 +3632,7 @@ function refresh() {
 function updateNav(name) {
   const map = { album: 'albums', artist: 'artists', playlist: 'playlists', oartist: 'discover' };
   const key = map[name] || name;
-  const lib = ['songs', 'albums', 'artists', 'favorites', 'album', 'artist', 'stats'].includes(name);
+  const lib = ['songs', 'albums', 'artists', 'favorites', 'album', 'artist', 'playlists', 'playlist', 'downloads'].includes(name);
   $$('[data-nav]').forEach((a) => {
     const n = a.dataset.nav;
     a.classList.toggle('active', n === key || (n === 'library' && lib) || (n === 'discover-m' && ['discover', 'radio', 'oartist'].includes(name)));
@@ -3649,6 +3707,14 @@ const actions = {
   'open-lyrics': () => { if (!curId) return; openOverlay('np'); setLyricsMode(true); },
   'toggle-lyrics': () => setLyricsMode(!lyricsOpen),
   'lyrics-edit': () => editLyrics(),
+  drawer: () => (overlays.includes('drawer') ? closeOverlay('drawer') : openOverlay('drawer')),
+  'drawer-close': () => closeOverlay('drawer'),
+  'drawer-go': (el) => { const h = el.getAttribute('href'); closeAllOverlays(); if (history.state?.overlay) history.replaceState(null, ''); location.hash = h; },
+  'dl-favs': () => downloadTracks([...S.tracks.values()].filter((t) => t.fav).map((t) => t.id), 'Favoriten'),
+  'dl-all': () => downloadTracks([...S.tracks.values()].map((t) => t.id), 'alle'),
+  'dl-clear': async () => { if (!await confirmDialog('Downloads löschen?', `${plural(dlIds.size, 'Song', 'Songs')} werden vom Gerät entfernt. In der Bibliothek bleiben sie und spielen weiter über das Internet.`, 'Löschen', true)) return; await removeDownloads([...dlIds]); toast('Downloads gelöscht'); },
+  output: () => pickOutput(),
+  'pb-autodl': (el) => { PB.autoDlFavs = !PB.autoDlFavs; savePB(); setSwitch(el, PB.autoDlFavs); if (PB.autoDlFavs) downloadTracks([...S.tracks.values()].filter((t) => t.fav).map((t) => t.id), 'Favoriten'); },
   'search-filter': (el) => { S.searchFilter = el.dataset.f; renderSearch(); },
   'stat-range': (el) => { S.statRange = el.dataset.r; render(true); },
   'play-hit': (el) => { const L = lists[el.dataset.list]; if (!L) return; playIds(L.ids, +el.dataset.i, { source: L.opts.source }); openOverlay('np'); setLyricsMode(true); },
@@ -3802,7 +3868,7 @@ function setupEvents() {
     if (kind === 'profile') {
       const display = (d.display || '').trim();
       if (!display) { toast('Der Anzeigename darf nicht leer sein.'); return; }
-      auth.update({ display, bio: (d.bio || '').trim(), genre: d.genre || 'all' });
+      auth.update({ display, bio: (d.bio || '').trim(), genre: d.genre || 'all', ...(d.color ? { color: d.color } : {}) });
       if (d.genre && d.genre !== 'all') S.discGenre = d.genre;
       updateProfileUI();
       refresh();
@@ -4404,6 +4470,216 @@ async function phoneConnect(forceLan = false) {
   });
 }
 
+/* =========================================================
+   Menü (Drawer) fürs Handy
+   ========================================================= */
+function renderDrawer() {
+  const a = auth.current();
+  const st = stats.summary('month');
+  const r = parseRoute().name;
+  const item = (route, href, ic, label, extra = '') => `<a href="${href}" class="${route === r ? 'on' : ''}" data-action="drawer-go">${icon(ic)}<span>${label}</span>${extra}</a>`;
+  $('#drawer').innerHTML = `
+    <a class="dr-profile" href="#/profil" data-action="drawer-go">${a ? avatarHTML(a, 'sm') : `<span class="avatar sm">${icon('user')}</span>`}
+      <span class="dr-who"><b>${esc(a?.display || 'Profil')}</b><small>Profil ansehen</small></span>${icon('chevron-right')}</a>
+    <a class="dr-stat" href="#/stats" data-action="drawer-go"><b>${minutes(st.total).toLocaleString('de')}</b><span>Minuten in 30 Tagen${st.artists[0] ? `<br><small>Top: ${esc(st.artists[0].name)}</small>` : ''}</span>${icon('stats')}</a>
+    <div class="dr-group"><small>Hören</small>
+      ${item('home', '#/', 'home', 'Start')}${item('discover', '#/discover', 'compass', 'Entdecken')}${item('radio', '#/radio', 'radio', 'Radio')}${item('search', '#/search', 'search', 'Suchen')}
+    </div>
+    <div class="dr-group"><small>Bibliothek</small>
+      ${item('songs', '#/songs', 'music', 'Titel')}${item('albums', '#/albums', 'disc', 'Alben')}${item('artists', '#/artists', 'user', 'Künstler')}${item('favorites', '#/favorites', 'heart', 'Favoriten')}${item('playlists', '#/playlists', 'playlist', 'Playlists')}${item('downloads', '#/downloads', 'download', 'Downloads', dlIds.size ? `<em>${dlIds.size}</em>` : '')}
+    </div>
+    <div class="dr-group"><small>Du</small>
+      ${item('stats', '#/stats', 'stats', 'Statistik')}${item('profil', '#/profil', 'user', 'Profil')}${item('settings', '#/settings', 'settings', 'Einstellungen')}
+    </div>`;
+}
+
+/* =========================================================
+   Mini-Player: Wischen
+   rechts = nächster Song · links = von vorne · 2× links schnell = vorheriger Song
+   ========================================================= */
+function prevTrack() {
+  if (!S.queue.length) return;
+  if (S.index > 0) S.index--;
+  else if (S.repeat === 'all') S.index = S.queue.length - 1;
+  else { audio.currentTime = 0; return; }
+  loadAndPlay(true);
+}
+function setupMiniSwipe() {
+  const bar = $('#player');
+  const area = $('.pb-left', bar);
+  const hint = document.createElement('div');
+  hint.className = 'swipe-hint';
+  hint.setAttribute('aria-hidden', 'true');
+  bar.appendChild(hint);
+  let st = null, lastLeft = 0, suppressClick = false;
+  const showHint = (kind, k) => {
+    const map = { next: ['next', 'Nächster Song'], restart: ['restart', 'Von vorne'], prev: ['prev', 'Vorheriger Song'] };
+    const [ic, txt] = map[kind];
+    if (hint.dataset.kind !== kind) { hint.dataset.kind = kind; hint.innerHTML = `${icon(ic)}<span>${txt}</span>`; }
+    hint.style.setProperty('--k', String(k));
+    hint.classList.toggle('left', kind !== 'next');
+  };
+  bar.addEventListener('pointerdown', (e) => {
+    if (e.pointerType === 'mouse' || !isMobile() || overlays.includes('np')) return;
+    if (e.target.closest('.pb-center button, .pb-fav, .pb-right')) return; // Knöpfe bleiben Knöpfe
+    st = { x: e.clientX, y: e.clientY, id: e.pointerId, swiping: false, dx: 0 };
+  }, { passive: true });
+  bar.addEventListener('pointermove', (e) => {
+    if (!st || e.pointerId !== st.id) return;
+    const dx = e.clientX - st.x, dy = e.clientY - st.y;
+    if (!st.swiping) {
+      if (Math.abs(dy) > 12 && Math.abs(dy) > Math.abs(dx)) { st = null; return; } // senkrecht: kein Wischen
+      if (Math.abs(dx) < 12) return;
+      st.swiping = true;
+      bar.classList.add('swiping');
+      try { bar.setPointerCapture(e.pointerId); } catch { /* */ }
+    }
+    st.dx = dx;
+    const k = Math.min(1, Math.abs(dx) / 90);
+    area.style.transform = `translateX(${dx * (1 - k * 0.35)}px)`;
+    area.style.opacity = String(1 - k * 0.45);
+    const kind = dx > 0 ? 'next' : (Date.now() - lastLeft < 1500 ? 'prev' : 'restart');
+    showHint(kind, k);
+  });
+  const end = () => {
+    if (!st) return;
+    const { swiping, dx } = st;
+    st = null;
+    bar.classList.remove('swiping');
+    area.style.transition = 'transform .28s var(--ease-out), opacity .28s';
+    area.style.transform = '';
+    area.style.opacity = '';
+    hint.style.setProperty('--k', '0');
+    setTimeout(() => { area.style.transition = ''; }, 300);
+    if (!swiping) return;
+    suppressClick = true;
+    setTimeout(() => { suppressClick = false; }, 350);
+    if (Math.abs(dx) < 64 || !curId) return;
+    navigator.vibrate?.(12);
+    if (dx > 0) { next(); flashHint('next'); return; }
+    const now = Date.now();
+    if (now - lastLeft < 1500) { lastLeft = 0; prevTrack(); flashHint('prev'); }
+    else { lastLeft = now; if (deferred) togglePlay(); else audio.currentTime = 0; updateProgress(); updatePosState(); flashHint('restart'); }
+  };
+  const flashHint = (kind) => { showHint(kind, 1); hint.classList.add('flash'); setTimeout(() => { hint.classList.remove('flash'); hint.style.setProperty('--k', '0'); }, 650); };
+  bar.addEventListener('pointerup', end);
+  bar.addEventListener('pointercancel', end);
+  // Ein Wischen ist kein Antippen (öffnet nicht den Vollbild-Player)
+  bar.addEventListener('click', (e) => { if (suppressClick) { e.stopPropagation(); e.preventDefault(); } }, true);
+}
+
+/* =========================================================
+   Downloads: Songs und Cover offline auf dem Gerät
+   ========================================================= */
+let dlIds = new Set();
+const isDl = (id) => dlIds.has(id);
+const canDownload = (t) => !!t && (t.remote === 'server' || t.remote === 'cloud');
+let dlQueue = Promise.resolve();
+async function downloadTracks(ids, label = '') {
+  const todo = ids.map(getT).filter((t) => canDownload(t) && !isDl(t.id));
+  if (!todo.length) { toast(ids.length ? 'Schon heruntergeladen' : 'Nichts zum Herunterladen'); return; }
+  try { await navigator.storage?.persist?.(); } catch { /* */ }
+  const pt = progressToast();
+  let done = 0, failed = 0;
+  dlQueue = dlQueue.then(async () => {
+    for (const t of todo) {
+      pt.text(`Lade herunter${label ? ` (${label})` : ''}: ${done + 1} von ${todo.length}`, done / todo.length);
+      try {
+        const res = await fetch(t.remote === 'server' ? withKey(encPath(t.streamUrl)) : cloudSrc(t.streamUrl));
+        if (!res.ok) throw new Error();
+        const blob = await res.blob();
+        await db.put('audio', { id: t.id, blob });
+        if (t.coverId) await coverUrl(t.coverId); // Cover gleich mit speichern
+        dlIds.add(t.id);
+        t.dl = true;
+        if (S.tracks.has(t.id)) await db.put('tracks', t);
+        done++;
+      } catch { failed++; }
+    }
+    pt.close(); toast(failed ? `${done} geladen, ${failed} fehlgeschlagen` : `${plural(done, 'Song', 'Songs')} offline verfügbar`);
+    markDownloads();
+  });
+  return dlQueue;
+}
+async function removeDownloads(ids) {
+  for (const id of ids) { if (!isDl(id)) continue; await db.del('audio', id).catch(() => {}); dlIds.delete(id); const t = getT(id); if (t) { t.dl = false; if (S.tracks.has(id)) db.put('tracks', t); } }
+  markDownloads();
+}
+function markDownloads(root = document) {
+  root.querySelectorAll('.row[data-id]').forEach((r) => r.classList.toggle('is-dl', isDl(r.dataset.id)));
+  if (parseRoute().name === 'downloads' || parseRoute().name === 'settings') render(true);
+}
+views.downloads = () => {
+  S.lastLib = 'downloads';
+  const ids = [...S.tracks.values()].filter((t) => isDl(t.id)).sort((a, b) => coll.compare(a.artist, b.artist) || coll.compare(a.title, b.title)).map((t) => t.id);
+  const size = ids.length;
+  const k = regList(ids, { source: 'Downloads' });
+  const favs = [...S.tracks.values()].filter((t) => t.fav && canDownload(t) && !isDl(t.id)).length;
+  return libTabs('downloads') + pageHead('Downloads', size ? `${plural(size, 'Song', 'Songs')} offline auf diesem Gerät` : 'Songs zum Offline-Hören')
+    + `<div class="actions-bar">${size ? playButtons(k) : ''}<span style="flex:1"></span>${favs ? `<button class="btn btn-sm" data-action="dl-favs">${icon('download')}Favoriten laden (${favs})</button>` : ''}</div>`
+    + (size ? listEl(k) : `<div class="empty-small">Noch nichts heruntergeladen.<br>Im ⋯-Menü eines Songs auf „Herunterladen“ tippen oder oben alle Favoriten laden.</div>`);
+};
+
+/* ---------- Schneller Songwechsel: nächsten Song im Voraus in den Speicher holen ---------- */
+const memPre = { id: null, url: null, ctrl: null };
+function dropMemPre() { memPre.ctrl?.abort(); if (memPre.url) URL.revokeObjectURL(memPre.url); memPre.id = memPre.url = memPre.ctrl = null; }
+async function prefetchNext() {
+  const i = upcomingIndex();
+  const id = i >= 0 ? S.queue[i] : null;
+  const t = getT(id);
+  if (!t || memPre.id === id || isDl(id) || !canDownload(t) || navigator.connection?.saveData) return;
+  dropMemPre();
+  memPre.id = id;
+  memPre.ctrl = new AbortController();
+  try {
+    const res = await fetch(t.remote === 'server' ? withKey(encPath(t.streamUrl)) : cloudSrc(t.streamUrl), { signal: memPre.ctrl.signal });
+    if (!res.ok || memPre.id !== id) return;
+    const blob = await res.blob();
+    if (memPre.id !== id) return;
+    memPre.url = URL.createObjectURL(blob);
+  } catch { if (memPre.id === id) memPre.id = null; }
+}
+
+/* =========================================================
+   Ausgabegerät: AirPlay/Bluetooth (iPhone, Mac) bzw. Lautsprecher am PC
+   ========================================================= */
+const canAirPlay = () => typeof audio.webkitShowPlaybackTargetPicker === 'function';
+const canSink = () => typeof HTMLMediaElement.prototype.setSinkId === 'function';
+async function pickOutput() {
+  if (canAirPlay()) { try { audio.webkitShowPlaybackTargetPicker(); } catch { /* */ } return; }
+  if (navigator.mediaDevices?.selectAudioOutput) {
+    try { const d = await navigator.mediaDevices.selectAudioOutput(); await setOutput(d.deviceId, d.label); } catch { /* abgebrochen */ }
+    return;
+  }
+  if (!canSink() || !navigator.mediaDevices?.enumerateDevices) {
+    toast('Hier wählst du das Gerät in den Bluetooth-Einstellungen des Handys bzw. im Kontrollzentrum.', 4500);
+    return;
+  }
+  let outs = (await navigator.mediaDevices.enumerateDevices()).filter((d) => d.kind === 'audiooutput');
+  if (outs.length && !outs.some((d) => d.label)) {
+    // Namen zeigt der Browser erst nach einer einmaligen Erlaubnis
+    try { const s = await navigator.mediaDevices.getUserMedia({ audio: true }); s.getTracks().forEach((x) => x.stop()); outs = (await navigator.mediaDevices.enumerateDevices()).filter((d) => d.kind === 'audiooutput'); } catch { /* */ }
+  }
+  const cur = ls.get('klang-sink', 'default');
+  openMenu([{ header: '<div><b>Wiedergabe auf</b><span>Bluetooth-Geräte (AirPods, Echo, Boxen) vorher mit dem PC koppeln</span></div>' },
+    ...outs.map((d) => ({ label: d.label || (d.deviceId === 'default' ? 'Standard' : 'Gerät'), icon: 'volume', checked: d.deviceId === cur, fn: () => setOutput(d.deviceId, d.label) }))], $('[data-action="output"]'));
+}
+async function setOutput(id, label) {
+  try { for (const el of allEls) await el.setSinkId(id); ls.set('klang-sink', id); toast(`Wiedergabe auf: ${label || 'Standard'}`, 2200); } catch { toast('Dieses Gerät lässt sich gerade nicht wählen.'); }
+}
+async function restoreOutput() {
+  const id = ls.get('klang-sink', null);
+  if (id && id !== 'default' && canSink()) { try { for (const el of allEls) await el.setSinkId(id); } catch { /* Gerät nicht da */ } }
+}
+
+/* ---------- Startlogo ---------- */
+function hideSplash() {
+  const sp = $('#splash');
+  if (!sp) return;
+  sp.classList.add('out');
+  setTimeout(() => sp.remove(), 600);
+}
+
 // iPhone-Startbildschirm-App: iOS gibt der App dort manchmal ein kürzeres Fenster als den Bildschirm.
 // Dann liegt der Rest schon über dem Home-Strich, und die untere Leiste braucht keinen Extra-Abstand.
 function fitStandalone() {
@@ -4434,6 +4710,8 @@ async function init() {
     S.playlists = playlists;
     coverKeys = new Set(ckeys);
     await lyr.loadAll();
+    const akeys = await db.getAllKeys('audio');
+    dlIds = new Set(akeys.filter((k) => { const t = S.tracks.get(k); return t && t.remote; }));
   } catch (e) {
     console.error(e);
     toast('Die Bibliothek konnte nicht geladen werden. Ist der private Modus aktiv?', 6000);
@@ -4443,9 +4721,12 @@ async function init() {
   setupWallHover();
   setupMediaSession();
   setupQueueDrag();
+  setupMiniSwipe();
+  restoreOutput();
   renderSidebarPlaylists();
   updateProfileUI();
   render();
+  setTimeout(hideSplash, 450);
   if (!auth.current()) showAuth('login');
   restorePlayer();
   setupLaunchQueue();
