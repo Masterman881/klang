@@ -92,8 +92,7 @@ input, textarea { caret-color: var(--accent); }
   /* Fest an alle vier Ränder: als Startbildschirm-App auf dem iPhone sind 100vh/100dvh
      kürzer als der Bildschirm, dann bleibt unten ein schwarzer Streifen */
   position: fixed;
-  inset: 0 0 auto 0;
-  height: var(--app-h, 100%);
+  inset: 0;
   grid-template-columns: var(--side-w) minmax(0, 1fr);
   grid-template-rows: minmax(0, 1fr) auto;
   grid-template-areas: "side main" "player player";
@@ -1327,3 +1326,9 @@ details.kbd summary, .discord-box summary { cursor: pointer; font-weight: 600; m
   .top-songs .row-dur { display: block; text-align: right; color: var(--muted); font-size: 13px; }
   .top-songs .row-more, .top-songs .row-fav { display: none; }
 }
+
+/* iPhone-Startbildschirm mit zu kleinem Fenster: der Bereich unter dem Fenster liegt schon über dem
+   Home-Strich, deshalb dort keinen zusätzlichen Abstand, damit die Beschriftung sichtbar bleibt */
+.ios-short #bottomnav { padding-bottom: 6px; }
+.ios-short #queue-list { padding-bottom: 20px; }
+html { background: var(--bg); }
