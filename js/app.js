@@ -2874,7 +2874,6 @@ function statBars(sum, range) {
   </figure>`;
 }
 views.stats = () => {
-  S.lastLib = 'stats';
   const range = S.statRange || 'month';
   const sum = stats.summary(range);
   const trackSec = new Map(sum.tracks.map((x) => [x.id, x]));
@@ -3638,7 +3637,7 @@ function updateNav(name) {
     a.classList.toggle('active', n === key || (n === 'library' && lib) || (n === 'discover-m' && ['discover', 'radio', 'oartist'].includes(name)));
   });
   const libLink = $('#bottomnav [data-nav="library"]');
-  if (libLink) libLink.href = `#/${S.lastLib}`;
+  if (libLink) libLink.href = `#/${['songs', 'albums', 'artists', 'favorites', 'playlists', 'downloads'].includes(S.lastLib) ? S.lastLib : 'songs'}`;
   $$('#side-playlists a').forEach((a) => a.classList.toggle('active', name === 'playlist' && a.dataset.pl === parseRoute().arg));
 }
 function renderSidebarPlaylists() {
