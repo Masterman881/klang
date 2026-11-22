@@ -2,6 +2,7 @@ import * as db from './db.js';
 import { readTags } from './tags.js';
 import { icon, hydrateIcons } from './icons.js';
 import { audius, radio } from './online.js';
+import * as auth from './auth.js';
 
 /* =========================================================
    Helfer
@@ -1644,7 +1645,7 @@ function discTabs(active) {
   return `<div class="chips m-only">${[['discover', 'Musik'], ['radio', 'Radio']]
     .map(([k, l]) => `<a class="chip ${k === active ? 'on' : ''}" href="#/${k}">${l}</a>`).join('')}</div>`;
 }
-const settingsBtn = () => `<button class="icon-btn lg m-only" data-action="color-menu" aria-label="Farbe und Live-Cover">${icon('palette')}</button><a class="icon-btn lg m-only" href="#/settings" aria-label="Einstellungen">${icon('settings')}</a>`;
+const settingsBtn = () => `${auth.current() ? `<a class="m-only profile-btn" href="#/profil" aria-label="Mein Profil">${avatarHTML(auth.current(), 'sm')}</a>` : ''}<button class="icon-btn lg m-only" data-action="color-menu" aria-label="Farbe und Live-Cover">${icon('palette')}</button><a class="icon-btn lg m-only" href="#/settings" aria-label="Einstellungen">${icon('settings')}</a>`;
 
 function emptyLib() {
   const folder = finePointer() && 'webkitdirectory' in document.createElement('input');
@@ -2230,6 +2231,156 @@ function setupWallHover() {
 }
 
 /* =========================================================
+   Konto: Login, Registrierung, Profil (alles nur auf diesem Gerät)
+   ========================================================= */
+const premiumBadge = (cls = '') => `<span class="premium ${cls}">${icon('crown')}<span>Premium</span></span>`;
+function avatarHTML(a, size = '') {
+  if (a?.avatar) return `<span class="avatar ${size}" style="background-image:url('${a.avatar}')" role="img" aria-label="Profilbild von ${esc(a.display)}"></span>`;
+  const initials = esc((a?.display || '?').trim().split(/\s+/).map((w) => w[0]).join('').slice(0, 2).toUpperCase());
+  return `<span class="avatar ${size}" style="--h:${hue(a?.display || '')}" aria-hidden="true">${initials}</span>`;
+}
+function updateProfileUI() {
+  const a = auth.current();
+  const chip = $('#side-profile');
+  if (chip) {
+    chip.classList.toggle('hidden', !a);
+    chip.innerHTML = a ? `${avatarHTML(a, 'sm')}<span class="sp-text"><b>${esc(a.display)}</b>${premiumBadge('sm')}</span>` : '';
+  }
+  if (a?.genre && a.genre !== 'all' && GENRES.some((g) => g[0] === a.genre)) S.discGenre = S.discGenre === 'all' ? a.genre : S.discGenre;
+}
+
+let authMode = 'login';
+function showAuth(mode = 'login') {
+  authMode = mode;
+  const el = $('#auth');
+  const reg = mode === 'register';
+  el.hidden = false;
+  document.body.classList.add('auth-open');
+  el.innerHTML = `
+    <div class="auth-wall" aria-hidden="true"></div>
+    <div class="auth-shade" aria-hidden="true"></div>
+    <form class="auth-card" novalidate data-form="auth">
+      <div class="auth-brand"><img src="icons/icon.svg" alt=""><span><b>KLANG</b><small>MUSIK</small></span></div>
+      <h1>${reg ? 'Konto erstellen' : 'Willkommen zurück'}</h1>
+      <p class="auth-sub">${reg ? 'Name und Passwort werden nur auf diesem Gerät gespeichert.' : 'Melde dich an. Dein Konto liegt nur auf diesem Gerät.'}</p>
+      <label class="field"><span>Name</span><input name="name" autocomplete="username" autocapitalize="none" spellcheck="false" maxlength="24" required><em class="field-err" data-err="name"></em></label>
+      <label class="field"><span>Passwort</span>
+        <span class="pw-wrap"><input name="pw" type="password" autocomplete="${reg ? 'new-password' : 'current-password'}" required><button type="button" class="icon-btn sm pw-eye" data-auth="eye" aria-label="Passwort anzeigen">${icon('eye')}</button></span>
+        <em class="field-err" data-err="pw"></em></label>
+      ${reg ? `<label class="field"><span>Passwort wiederholen</span><input name="pw2" type="password" autocomplete="new-password" required><em class="field-err" data-err="pw2"></em></label>` : ''}
+      <button class="btn-cta auth-go" type="submit">${icon(reg ? 'crown' : 'play')}<span>${reg ? 'Konto erstellen' : 'Einloggen'}</span></button>
+      <button type="button" class="auth-switch" data-auth="switch">${reg ? 'Schon ein Konto? <b>Einloggen</b>' : 'Neu hier? <b>Konto erstellen</b>'}</button>
+    </form>`;
+  setTimeout(() => el.querySelector('input[name="name"]')?.focus(), 80);
+  // Hintergrund: eine langsam treibende Wand aus angesagten Covern
+  cached('trend:all:week', () => audius.trending(null, 'week', 50)).then((list) => {
+    const wall = el.querySelector('.auth-wall');
+    if (!wall) return;
+    const covers = list.map((t) => t.coverId).filter(Boolean).slice(0, 30);
+    list.forEach((t) => regAlts(t.coverId, t.coverAlts));
+    if (covers.length < 6) return;
+    const cols = 6;
+    wall.innerHTML = Array.from({ length: cols }, (_, c) => `<div class="aw-col">${[...covers.slice(c * 5, c * 5 + 5), ...covers.slice(c * 5, c * 5 + 5)].map((id) => coverHTML(id, id)).join('')}</div>`).join('');
+    hydrateCovers(wall);
+  }).catch(() => {});
+  if (motionOK()) gsap.from(el.querySelector('.auth-card'), { y: 30, opacity: 0, duration: 0.9, ease: 'expo.out', delay: 0.1 });
+}
+function hideAuth() {
+  const el = $('#auth');
+  const done = () => { el.hidden = true; el.innerHTML = ''; document.body.classList.remove('auth-open'); };
+  if (!motionOK()) { done(); return; }
+  gsap.timeline({ onComplete: done })
+    .to(el.querySelector('.auth-card'), { y: -24, opacity: 0, duration: 0.45, ease: 'power2.in' })
+    .to(el, { clipPath: 'inset(0 0 100% 0)', duration: 0.7, ease: 'expo.inOut' }, 0.2);
+}
+function setFieldErr(form, field, msg) {
+  form.querySelectorAll('.field-err').forEach((e) => { e.textContent = ''; });
+  form.querySelectorAll('input').forEach((i) => i.removeAttribute('aria-invalid'));
+  if (!field) return;
+  const e = form.querySelector(`[data-err="${field}"]`);
+  if (e) e.textContent = msg;
+  const inp = form.querySelector(`[name="${field}"]`);
+  if (inp) { inp.setAttribute('aria-invalid', 'true'); inp.focus(); }
+  if (motionOK()) gsap.fromTo(form, { x: -8 }, { x: 0, duration: 0.5, ease: 'elastic.out(1, .35)' });
+}
+async function submitAuth(form) {
+  const btn = form.querySelector('.auth-go');
+  btn.disabled = true;
+  const d = Object.fromEntries(new FormData(form));
+  const r = authMode === 'register' ? await auth.register(d.name, d.pw || '', d.pw2 || '') : await auth.login(d.name, d.pw || '');
+  btn.disabled = false;
+  if (!r.ok) { setFieldErr(form, r.error, r.msg); return; }
+  updateProfileUI();
+  hideAuth();
+  toast(authMode === 'register' ? `Konto erstellt. Willkommen, ${r.account.display}!` : `Willkommen zurück, ${r.account.display}`);
+  render(true);
+}
+
+views.profil = () => {
+  const a = auth.current();
+  if (!a) return notFound();
+  const all = [...S.tracks.values()];
+  const since = new Date(a.createdAt).toLocaleDateString('de', { month: 'long', year: 'numeric' });
+  const genreOpts = GENRES.map(([k, l]) => `<option value="${k}" ${a.genre === k ? 'selected' : ''}>${k === 'all' ? 'Keins' : l}</option>`).join('');
+  return `<div class="hero profile-hero" style="--h:${hue(a.display)}">
+      <div class="avatar-wrap">${avatarHTML(a, 'xl')}<button class="avatar-edit" data-action="avatar-pick" aria-label="Profilbild ändern">${icon('image')}</button></div>
+      <div class="hero-info">
+        ${premiumBadge('lg')}
+        <h1>${esc(a.display)}</h1>
+        <p>${[`@${esc(a.name)}`, `Mitglied seit ${since}`, plural(all.length, 'Titel', 'Titel'), plural(S.playlists.length, 'Playlist', 'Playlists'), plural(all.filter((t) => t.fav).length, 'Favorit', 'Favoriten')].map((x) => `<span class="nowrap">${x}</span>`).join(' · ')}</p>
+        ${a.bio ? `<p class="profile-bio">${esc(a.bio)}</p>` : ''}
+      </div>
+    </div>
+    <div class="settings">
+      <div class="set-card">
+        <h2>Profil</h2>
+        <form data-form="profile" novalidate>
+          <label class="field"><span>Anzeigename</span><input name="display" value="${esc(a.display)}" maxlength="32" autocomplete="nickname"></label>
+          <label class="field"><span>Status</span><input name="bio" value="${esc(a.bio || '')}" maxlength="90" placeholder="Was hörst du gerade am liebsten?"></label>
+          <label class="field"><span>Lieblingsgenre (startet Entdecken damit)</span><select class="select wide-select" name="genre">${genreOpts}</select></label>
+          <div class="btn-row"><button class="btn btn-accent" type="submit">${icon('check')}Speichern</button>
+            <button class="btn" type="button" data-action="avatar-pick">${icon('image')}Profilbild ändern</button>
+            ${a.avatar ? `<button class="btn" type="button" data-action="avatar-remove">${icon('x')}Bild entfernen</button>` : ''}</div>
+        </form>
+      </div>
+      <div class="set-card">
+        <h2>Passwort ändern</h2>
+        <p>Für das Startkonto bitte ein eigenes Passwort setzen.</p>
+        <form data-form="password" novalidate>
+          <label class="field"><span>Aktuelles Passwort</span><input name="old" type="password" autocomplete="current-password"><em class="field-err" data-err="old"></em></label>
+          <div class="field-grid">
+            <label class="field"><span>Neues Passwort</span><input name="new" type="password" autocomplete="new-password"><em class="field-err" data-err="new"></em></label>
+            <label class="field"><span>Wiederholen</span><input name="new2" type="password" autocomplete="new-password"><em class="field-err" data-err="new2"></em></label>
+          </div>
+          <button class="btn btn-accent" type="submit">${icon('check')}Passwort speichern</button>
+        </form>
+      </div>
+      <div class="set-card">
+        <h2>Abmelden</h2>
+        <p>Deine Musik, Playlists und Favoriten bleiben auf dem Gerät. Beim nächsten Öffnen fragt Klang wieder nach Name und Passwort.</p>
+        <button class="btn btn-danger" data-action="logout">${icon('logout')}Abmelden</button>
+      </div>
+    </div>`;
+};
+
+async function pickAvatar() {
+  const file = await pickFile('#image-input');
+  if (!file) return;
+  try {
+    const bmp = await createImageBitmap(file);
+    const s = Math.min(bmp.width, bmp.height);
+    const c = document.createElement('canvas');
+    c.width = c.height = 256;
+    c.getContext('2d').drawImage(bmp, (bmp.width - s) / 2, (bmp.height - s) / 2, s, s, 0, 0, 256, 256);
+    const url = c.toDataURL('image/jpeg', 0.86);
+    if (!auth.update({ avatar: url })) { toast('Bild konnte nicht gespeichert werden.'); return; }
+    updateProfileUI();
+    refresh();
+    toast('Profilbild gespeichert');
+  } catch { toast('Dieses Bild konnte nicht gelesen werden.'); }
+}
+
+/* =========================================================
    Router
    ========================================================= */
 function parseRoute() {
@@ -2374,6 +2525,16 @@ const actions = {
     if (parseRoute().name === 'radio') render(true); else go('radio');
   },
   retry: () => { apiCache.clear(); refresh(); },
+  'avatar-pick': () => pickAvatar(),
+  'avatar-remove': () => { auth.update({ avatar: null }); updateProfileUI(); refresh(); toast('Profilbild entfernt'); },
+  logout: async () => {
+    if (!await confirmDialog('Abmelden?', 'Deine Musik bleibt auf dem Gerät. Zum Weiterhören meldest du dich wieder an.', 'Abmelden')) return;
+    audio.pause();
+    auth.logout();
+    updateProfileUI();
+    location.hash = '#/';
+    showAuth('login');
+  },
   'feat-go': (el) => { if (+el.dataset.i !== feat.i) showFeature(+el.dataset.i); },
   'feat-pause': (el) => {
     feat.paused = !feat.paused;
@@ -2416,6 +2577,45 @@ function rowCtx(row) {
 }
 
 function setupEvents() {
+  // Formulare: Login/Registrierung, Profil, Passwort
+  document.addEventListener('submit', async (e) => {
+    const form = e.target.closest('form[data-form]');
+    if (!form) return;
+    e.preventDefault();
+    const kind = form.dataset.form;
+    if (kind === 'auth') { submitAuth(form); return; }
+    const d = Object.fromEntries(new FormData(form));
+    if (kind === 'profile') {
+      const display = (d.display || '').trim();
+      if (!display) { toast('Der Anzeigename darf nicht leer sein.'); return; }
+      auth.update({ display, bio: (d.bio || '').trim(), genre: d.genre || 'all' });
+      if (d.genre && d.genre !== 'all') S.discGenre = d.genre;
+      updateProfileUI();
+      refresh();
+      toast('Profil gespeichert');
+    } else if (kind === 'password') {
+      const r = await auth.changePassword(d.old || '', d.new || '', d.new2 || '');
+      if (!r.ok) { setFieldErr(form, r.error, r.msg); return; }
+      setFieldErr(form, null);
+      form.reset();
+      toast('Neues Passwort gespeichert');
+    }
+  });
+  document.addEventListener('click', (e) => {
+    const au = e.target.closest('[data-auth]');
+    if (au) {
+      e.preventDefault();
+      if (au.dataset.auth === 'switch') showAuth(authMode === 'login' ? 'register' : 'login');
+      if (au.dataset.auth === 'eye') {
+        const inp = au.parentElement.querySelector('input');
+        const show = inp.type === 'password';
+        inp.type = show ? 'text' : 'password';
+        au.innerHTML = icon(show ? 'eye-off' : 'eye');
+        au.setAttribute('aria-label', show ? 'Passwort verbergen' : 'Passwort anzeigen');
+      }
+      return;
+    }
+  }, true);
   document.addEventListener('click', (e) => {
     const a = e.target.closest('[data-action]');
     if (a && !a.disabled) {
@@ -2559,6 +2759,7 @@ function setupEvents() {
 
   // Tastatur
   document.addEventListener('keydown', (e) => {
+    if (document.body.classList.contains('auth-open')) return;
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); go('search'); return; }
     if ((e.key === 'Enter' || e.key === ' ') && e.target.matches?.('[role="button"][data-action]')) { e.preventDefault(); e.target.click(); return; }
     const tag = e.target.tagName;
@@ -2673,7 +2874,9 @@ async function init() {
   setupWallHover();
   setupMediaSession();
   renderSidebarPlaylists();
+  updateProfileUI();
   render();
+  if (!auth.current()) showAuth('login');
   restorePlayer();
   setupLaunchQueue();
   registerSW();
