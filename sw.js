@@ -1,6 +1,6 @@
 // Service Worker: macht Klang offline-fähig und installierbar.
 // Bei Änderungen an der App die Versionsnummer erhöhen.
-const CACHE = 'klang-v13';
+const CACHE = 'klang-v14';
 const ASSETS = [
   './',
   'index.html',

@@ -67,7 +67,7 @@ const S = {
 const remote = new Map();
 const getT = (id) => S.tracks.get(id) || remote.get(id);
 // Online = Audius/Radio. Songs aus dem lokalen Musik-Ordner (remote: 'server') zählen als eigene Musik.
-const isOnline = (t) => !!t?.remote && t.remote !== 'server';
+const isOnline = (t) => !!t?.remote && t.remote !== 'server' && t.remote !== 'cloud';
 
 // Zugangsschlüssel zum Musik-Ordner auf dem PC (kommt per QR-Code aufs Handy, bleibt nur auf dem Gerät)
 const SRV_KEY = 'klang-srv-key';
@@ -78,6 +78,19 @@ const SRV_KEY = 'klang-srv-key';
     history.replaceState(null, '', location.pathname + location.hash); // Schlüssel nicht in der Adresszeile lassen
   }
 })();
+// Privater Cloud-Speicher (Cloudflare R2 hinter dem Klang-Worker). Zugang kommt per QR-Code als #cloud=…&ck=…
+const CLOUD = 'klang-cloud';
+(() => {
+  const m = /^#cloud=([^&]+)&ck=([^&]+)/.exec(location.hash);
+  if (!m) return;
+  try {
+    const url = decodeURIComponent(m[1]).replace(/\/+$/, '');
+    if (/^https:\/\/[a-z0-9.-]+$/i.test(url)) ls.set(CLOUD, { url, key: decodeURIComponent(m[2]) });
+  } catch { /* */ }
+  history.replaceState(null, '', location.pathname + location.search + '#/');
+})();
+const cloudCfg = () => { const c = ls.get(CLOUD, null); return c?.url && c?.key ? c : null; };
+const cloudSrc = (path) => { const c = cloudCfg(); return c ? `${c.url}${encPath(path)}?k=${encodeURIComponent(c.key)}` : ''; };
 function withKey(url) {
   let k = null;
   try { k = localStorage.getItem(SRV_KEY); } catch { /* */ }
@@ -329,17 +342,17 @@ async function storeArtistPic(key, blob) {
 async function applyArtistPicsToTracks() {
   const changed = [];
   for (const t of S.tracks.values()) {
-    if (t.remote !== 'server' || (t.coverId && !t.coverId.startsWith('a:'))) continue;
+    if ((t.remote !== 'server' && t.remote !== 'cloud') || (t.coverId && !t.coverId.startsWith('a:'))) continue;
     const id = artistPicId(t.artist);
     if (id && t.coverId !== id) { t.coverId = id; changed.push(t); }
   }
   if (changed.length) { try { await db.putMany('tracks', changed); } catch { /* */ } }
   return changed.length;
 }
-async function syncArtistPics() {
+async function syncArtistPics(src = { list: withKey('/api/pics'), file: (u) => withKey(u) }) {
   let pics;
   try {
-    const r = await fetch(withKey('/api/pics'), { cache: 'no-store' });
+    const r = await fetch(src.list, { cache: 'no-store' });
     if (!r.ok) return;
     pics = await r.json();
   } catch { return; }
@@ -355,7 +368,7 @@ async function syncArtistPics() {
     const ver = `${best.url}|${best.v}`;
     if (seen[key] === ver && coverKeys.has('a:' + key)) continue;
     try {
-      const r = await fetch(withKey(best.url));
+      const r = await fetch(src.file(best.url));
       if (!r.ok) continue;
       await storeArtistPic(key, await r.blob());
       seen[key] = ver;
@@ -576,7 +589,7 @@ async function loadAndPlay(autoplay = true, startAt = 0) {
       return;
     }
     if (t.remote !== 'server' && !navigator.onLine) toast('Keine Internetverbindung – Online-Titel brauchen Internet.', 3500);
-    src = t.remote === 'server' ? withKey(encPath(t.streamUrl)) : t.streamUrl;
+    src = t.remote === 'server' ? withKey(encPath(t.streamUrl)) : t.remote === 'cloud' ? cloudSrc(t.streamUrl) : t.streamUrl;
   } else {
     let rec = null;
     try { rec = await db.get('audio', id); } catch { /* */ }
@@ -2523,8 +2536,16 @@ views.settings = () => {
     </div>
     ${S.srvOK && /^(localhost|127\.0\.0\.1|\[::1\])$/.test(location.hostname) ? `<div class="set-card">
       <h2>Aufs Handy</h2>
-      <p>Deine Songs aus dem Musik-Ordner am Handy hören: QR-Code scannen, fertig. Mit „Für unterwegs“ kommen sie danach auch offline aufs Handy.</p>
+      <p>Deine Songs am Handy hören: QR-Code scannen, fertig. Mit der Cloud geht das überall, auch ohne PC.</p>
       <button class="btn btn-accent" data-action="phone-connect">${icon('phone')}QR-Code zeigen</button>
+    </div>` : ''}
+    ${cloudCfg() && !S.srvOK ? `<div class="set-card">
+      <h2>Cloud</h2>
+      <p>Verbunden mit deinem privaten Cloud-Speicher: ${plural([...S.tracks.values()].filter((t) => t.remote === 'cloud').length, 'Song', 'Songs')}. Läuft überall mit Internet.</p>
+      <div class="btn-row">
+        <button class="btn btn-accent" data-action="cloud-reload">${icon('refresh')}Neu laden</button>
+        <button class="btn btn-danger" data-action="cloud-off">Trennen</button>
+      </div>
     </div>` : ''}
     <div class="set-card">
       <h2>Speicher</h2>
@@ -2958,6 +2979,11 @@ const actions = {
   'import-files': () => { $('#file-input').value = ''; $('#file-input').click(); },
   'import-folder': () => { $('#folder-input').value = ''; $('#folder-input').click(); },
   'reload-server-lib': () => loadServerLibrary(true),
+  'cloud-reload': () => loadCloudLibrary(true),
+  'cloud-off': async () => {
+    const r = await openDialog({ title: 'Cloud trennen?', body: '<p>Die Cloud-Songs verschwinden von diesem Gerät (Favoriten bleiben). Deine Songs in der Cloud bleiben erhalten, du kannst dich per QR-Code jederzeit neu verbinden.</p>', buttons: [{ label: 'Abbrechen' }, { label: 'Trennen', danger: true, value: 'ok' }] });
+    if (r) { cloudDisconnect(); refresh(); }
+  },
   'phone-connect': () => phoneConnect(),
   eq: () => eqDialog(),
   pack: (el) => packFor(el.dataset.list),
@@ -3435,9 +3461,61 @@ async function loadServerLibrary(showToast = false) {
   syncArtistPics();
 }
 
+/* ---------- Cloud: alle Songs von überall (privater Speicher, nur mit Schlüssel) ---------- */
+async function loadCloudLibrary(showToast = false) {
+  const c = cloudCfg();
+  if (!c) return;
+  let list;
+  try {
+    const r = await fetch(`${c.url}/api/music?k=${encodeURIComponent(c.key)}`, { cache: 'no-store' });
+    if (r.status === 403) { toast('Cloud-Zugang ungültig. Scanne den QR-Code am PC neu („Aufs Handy“).', 5000); return; }
+    if (!r.ok) throw new Error();
+    list = await r.json();
+    if (!Array.isArray(list)) throw new Error();
+  } catch {
+    if (showToast) toast(navigator.onLine ? 'Cloud gerade nicht erreichbar.' : 'Kein Internet: Cloud-Songs brauchen Internet.', 4000);
+    return;
+  }
+  S.cloudOK = true;
+  let added = 0;
+  const fresh = [];
+  for (const item of list) {
+    let path;
+    try { path = item.url.split('/').map(decodeURIComponent).join('/'); } catch { continue; }
+    const id = 'cloud:' + path;
+    const known = S.tracks.get(id);
+    if (known) { if (item.size && known.size !== item.size) { known.size = item.size; fresh.push(known); } continue; }
+    const track = {
+      id, remote: 'cloud', streamUrl: path,
+      title: item.file.replace(/\.[^.]+$/, ''),
+      artist: item.artist || 'Unbekannter Künstler',
+      album: item.artist || 'Cloud',
+      albumArtist: item.artist || '',
+      year: '', genre: '', trackNo: 0, discNo: 0, duration: 0,
+      fileName: item.file, size: item.size || 0, coverId: null,
+      fav: false, favAt: 0, playCount: 0, lastPlayed: 0, addedAt: Date.now(),
+    };
+    S.tracks.set(id, track);
+    fresh.push(track);
+    added++;
+  }
+  if (fresh.length) { try { await db.putMany('tracks', fresh); } catch { /* */ } }
+  if (added) { invalidate(); refresh(); }
+  if (showToast) toast(added ? `${plural(added, 'Song', 'Songs')} aus der Cloud geladen` : `Alles aktuell: ${plural(list.length, 'Song', 'Songs')} in der Cloud`, 3000);
+  const k = encodeURIComponent(c.key);
+  syncArtistPics({ list: `${c.url}/api/pics?k=${k}`, file: (u) => `${c.url}${u}?k=${k}` });
+}
+function cloudDisconnect() {
+  ls.set(CLOUD, null);
+  const ids = [...S.tracks.values()].filter((t) => t.remote === 'cloud' && !t.fav).map((t) => t.id);
+  for (const id of ids) S.tracks.delete(id);
+  Promise.all(ids.map((id) => db.del('tracks', id).catch(() => {}))).then(() => { invalidate(); refresh(); });
+  toast('Cloud getrennt');
+}
+
 /* ---------- Für unterwegs: Songs vom PC als Paket aufs Handy ---------- */
 // Jeden Pfadteil einzeln kodieren, damit auch Namen mit # oder ? funktionieren
-const encPath = (p) => p.split('/').map((s) => encodeURIComponent(s)).join('/');
+function encPath(p) { return p.split('/').map((s) => encodeURIComponent(s)).join('/'); }
 function packBtn(k) {
   if (!S.srvOK) return '';
   const n = (lists[k]?.ids || []).filter((id) => getT(id)?.remote === 'server').length;
@@ -3488,7 +3566,33 @@ function loadScript(src) {
   });
 }
 const ipRank = (u) => (/\/\/192\.168\./.test(u) ? 0 : /\/\/10\./.test(u) ? 1 : /\/\/172\./.test(u) ? 2 : 3);
-async function phoneConnect() {
+const APP_URL = 'https://masterman881.github.io/klang/';
+async function phoneConnect(forceLan = false) {
+  // Mit eingerichteter Cloud: Handy-Zugang von überall (HTTPS, installierbar, PC muss nicht laufen)
+  if (!forceLan) {
+    let c = null;
+    try { const r = await fetch('/api/cloud', { cache: 'no-store' }); if (r.ok) c = await r.json(); } catch { /* */ }
+    if (c?.url && c?.key) {
+      await loadScript('js/vendor/qrcode.js');
+      const link = `${APP_URL}#cloud=${encodeURIComponent(c.url)}&ck=${encodeURIComponent(c.key)}`;
+      const qr = qrcode(0, 'M'); qr.addData(link); qr.make();
+      const n = [...S.tracks.values()].filter((t) => t.remote === 'server').length;
+      const r = await openDialog({
+        title: 'Aufs Handy',
+        body: `<div class="qr">${qr.createSvgTag({ cellSize: 5, margin: 2, scalable: true, alt: 'QR-Code für Klang mit Cloud-Zugang' })}</div>
+          <ol class="steps">
+            <li>Code mit der <b>Handy-Kamera</b> scannen und den Link öffnen.</li>
+            <li>Einloggen. ${n ? `Deine ${n.toLocaleString('de')} Songs` : 'Deine Songs'} kommen aus deiner privaten Cloud, <b>überall</b>, auch ohne WLAN und ohne PC.</li>
+            <li>Klang zum Startbildschirm hinzufügen (iPhone: Teilen → „Zum Home-Bildschirm“).</li>
+          </ol>
+          <p class="small muted">Der Code enthält deinen geheimen Cloud-Schlüssel. Zeig ihn niemandem. Unterwegs braucht das Handy Internet.</p>
+          <p class="small muted"><button class="link" type="button" data-value="lan">Stattdessen nur im WLAN vom PC hören</button></p>`,
+        buttons: [{ label: 'Fertig', primary: true, value: 'ok' }],
+      });
+      if (r?.value === 'lan') phoneConnect(true);
+      return;
+    }
+  }
   let info;
   try {
     const r = await fetch('/api/lan', { cache: 'no-store' });
@@ -3563,8 +3667,8 @@ async function init() {
   restorePlayer();
   setupLaunchQueue();
   registerSW();
-  // Musik-Ordner automatisch laden
-  loadServerLibrary(false);
+  // Musik-Ordner automatisch laden; ohne PC-Server (z. B. unterwegs am Handy) den Cloud-Speicher
+  loadServerLibrary(false).then(() => { if (!S.srvOK && cloudCfg()) loadCloudLibrary(false); });
 }
 
 init();
