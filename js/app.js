@@ -635,13 +635,14 @@ function setVolume(level = vol.level, muted = vol.muted) {
 }
 const fades = new Map();
 function cancelFade(el) { clearTimeout(fades.get(el)); fades.delete(el); }
-// Gleichmäßig laut überblenden (equal power): rein mit Sinus, raus mit Kosinus
+// Sanft überblenden wie das Ohr es hört: der neue Song kommt ganz leise und wird erst gegen Ende richtig laut,
+// der alte wird gleichmäßig leiser. In der Mitte sind beide hörbar und mischen sich.
 function fade(el, dir, secs, done) {
   cancelFade(el);
   const t0 = performance.now();
   const step = () => {
     const k = secs > 0 ? Math.min(1, (performance.now() - t0) / (secs * 1000)) : 1;
-    volFactor.set(el, dir === 'in' ? Math.sin(k * Math.PI / 2) : Math.cos(k * Math.PI / 2));
+    volFactor.set(el, dir === 'in' ? k * k * k : 1 - k * k);
     applyVol(el);
     if (k < 1) fades.set(el, setTimeout(step, 30));
     else { fades.delete(el); if (dir === 'in') { volFactor.delete(el); applyVol(el); } done?.(); }
