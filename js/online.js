@@ -13,6 +13,13 @@ async function aget(path, params = {}) {
 }
 
 const pic = (o, size = '480x480') => (o && o[size] ? 'url:' + o[size] : null);
+// Audius liefert pro Bild Ersatz-Server mit: gleiche Datei, anderer Host
+const alts = (o, size = '480x480') => {
+  if (!o || !o[size] || !Array.isArray(o.mirrors)) return [];
+  let path;
+  try { path = new URL(o[size]).pathname; } catch { return []; }
+  return o.mirrors.map((m) => m.replace(/\/$/, '') + path).filter((u) => u !== o[size]);
+};
 const playable = (x) => x && x.is_streamable !== false && !x.is_stream_gated && x.access?.stream !== false && !x.is_delete && x.is_available !== false;
 
 export function normTrack(x) {
@@ -24,6 +31,7 @@ export function normTrack(x) {
     artist: (u.name || 'Unbekannter Künstler').trim(),
     artistId: u.id || x.user_id || null,
     artistPic: pic(u.profile_picture),
+    artistPicAlts: alts(u.profile_picture),
     artistVerified: !!u.is_verified,
     artistFollowers: u.follower_count || 0,
     album: 'Online',
@@ -34,6 +42,9 @@ export function normTrack(x) {
     discNo: 0,
     duration: x.duration || 0,
     coverId: pic(x.artwork) || pic(u.profile_picture),
+    coverAlts: x.artwork?.['480x480'] ? alts(x.artwork) : alts(u.profile_picture),
+    coverHi: pic(x.artwork, '1000x1000'),
+    coverHiAlts: alts(x.artwork, '1000x1000'),
     streamUrl: `${AUDIUS}/tracks/${x.id}/stream?app_name=${APP}`,
     permalink: x.permalink ? 'https://audius.co' + x.permalink : null,
     plays: x.play_count || 0,
@@ -51,6 +62,7 @@ export function normUser(u) {
     trackCount: u.track_count || 0,
     verified: !!u.is_verified,
     pic: pic(u.profile_picture),
+    picAlts: alts(u.profile_picture),
     bio: u.bio || '',
   };
 }

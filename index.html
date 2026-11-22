@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <meta name="theme-color" content="#0a0f1e">
+  <meta name="theme-color" content="#08080a">
   <meta name="description" content="Klang – dein eigener Musikplayer. Offline, werbefrei, kostenlos.">
   <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-capable" content="yes">
@@ -13,15 +13,20 @@
   <link rel="icon" href="icons/icon.svg" type="image/svg+xml">
   <link rel="apple-touch-icon" href="icons/icon-192.png">
   <title>Klang</title>
-  <link rel="preload" href="fonts/barlow-condensed-800-italic-latin.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="preload" href="fonts/oswald-latin.woff2" as="font" type="font/woff2" crossorigin>
   <link rel="preload" href="fonts/barlow-400-latin.woff2" as="font" type="font/woff2" crossorigin>
   <link rel="stylesheet" href="css/fonts.css">
   <link rel="stylesheet" href="css/style.css">
+  <!-- Animation: GSAP 3.15 (Standard-Lizenz, kostenlos) und Lenis 1.3 (MIT), lokal eingebunden -->
+  <script src="js/vendor/gsap.min.js" defer></script>
+  <script src="js/vendor/ScrollTrigger.min.js" defer></script>
+  <script src="js/vendor/SplitText.min.js" defer></script>
+  <script src="js/vendor/lenis.min.js" defer></script>
 </head>
 <body>
   <div id="app">
     <aside id="sidebar">
-      <a class="brand" href="#/"><img src="icons/icon.svg" alt=""><span>KLANG</span></a>
+      <a class="brand" href="#/"><img src="icons/icon.svg" alt=""><span><b>KLANG</b><small>MUSIK</small></span></a>
       <nav class="side-nav">
         <a href="#/" data-nav="home"><i data-icon="home"></i>Start</a>
         <a href="#/search" data-nav="search"><i data-icon="search"></i>Suchen</a>
@@ -55,7 +60,6 @@
     <footer id="player" class="hidden">
       <div class="mini-progress"><div data-np="bar"></div></div>
       <div class="pb-left">
-        <div class="bug-tab" aria-hidden="true"><small data-np="bug-label">Läuft</small><b data-np="cur">0:00</b></div>
         <button class="pb-art" data-action="open-np" aria-label="Wiedergabe öffnen"><div class="cover" data-np="cover"></div></button>
         <div class="pb-meta" data-action="open-np-mobile">
           <div class="pb-title" data-np="title"></div>
@@ -108,7 +112,6 @@
       <div class="np-art"><div class="cover" data-np="cover"></div></div>
       <div class="np-lyrics" id="np-lyrics" aria-live="off"></div>
       <div class="np-meta">
-        <div class="bug-tab lg" aria-hidden="true"><small data-np="bug-label">Läuft</small><b data-np="cur">0:00</b></div>
         <div class="np-text">
           <div class="np-title" data-np="title"></div>
           <a class="np-artist" data-np="artist-link" data-action="goto-artist" href="#"></a>

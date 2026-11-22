@@ -66,6 +66,9 @@ const getT = (id) => S.tracks.get(id) || remote.get(id);
 const hasT = (id) => S.tracks.has(id) || remote.has(id);
 function adopt(list) {
   return list.map((t) => {
+    regAlts(t.coverId, t.coverAlts);
+    regAlts(t.coverHi, t.coverHiAlts);
+    regAlts(t.artistPic, t.artistPicAlts);
     const saved = S.tracks.get(t.id);
     if (saved) return saved.id;
     remote.set(t.id, t);
@@ -169,9 +172,23 @@ const coverUrls = new Map();
 let coverKeys = new Set();
 const tintCache = new Map();
 
+// Online-Bilder: erst testen, bei Fehler die Ersatz-Server der Reihe nach probieren
+const coverAlts = new Map();
+function regAlts(id, list) { if (id && list?.length && !coverAlts.has(id)) coverAlts.set(id, list); }
+const tryImage = (u) => new Promise((r) => {
+  const i = new Image();
+  const timer = setTimeout(() => r(false), 6000);
+  i.onload = () => { clearTimeout(timer); r(i.naturalWidth > 0); };
+  i.onerror = () => { clearTimeout(timer); r(false); };
+  i.src = u;
+});
+async function firstWorking(list) { for (const u of list) if (await tryImage(u)) return u; return null; }
 function coverUrl(id) {
   if (!id) return Promise.resolve(null);
-  if (id.startsWith('url:')) return Promise.resolve(id.slice(4));
+  if (id.startsWith('url:')) {
+    if (!coverUrls.has(id)) coverUrls.set(id, firstWorking([id.slice(4), ...(coverAlts.get(id) || [])]));
+    return coverUrls.get(id);
+  }
   if (!coverUrls.has(id)) {
     coverUrls.set(id, db.get('covers', id).then((r) => (r ? URL.createObjectURL(r.blob) : null)).catch(() => null));
   }
@@ -193,11 +210,6 @@ async function loadCover(el) {
   const id = el.dataset.cover;
   const u = await coverUrl(id);
   if (!u || el.dataset.cover !== id) return;
-  if (id.startsWith('url:')) {
-    // Online-Bild erst vorladen, damit kaputte Bilder den Platzhalter behalten
-    const ok = await new Promise((r) => { const i = new Image(); i.onload = () => r(i.naturalWidth > 0); i.onerror = () => r(false); i.src = u; });
-    if (!ok || el.dataset.cover !== id) return;
-  }
   el.style.backgroundImage = `url("${u.replace(/"/g, '%22')}")`;
   el.classList.add('has-img');
 }
@@ -386,7 +398,18 @@ function closeAllOverlays() {
 }
 function setOverlayClass(name, on) {
   if (name === 'np') {
-    $('#np').classList.toggle('open', on);
+    // Signatur: Das Cover fliegt aus der Player-Leiste in den Vollbild-Player (und zurück)
+    const np = $('#np');
+    const apply = () => {
+      np.classList.toggle('open', on);
+      document.body.classList.toggle('np-open', on);
+    };
+    if (np.classList.contains('open') !== on) {
+      np.classList.add('vt');
+      const vt = withTransition('np', apply);
+      if (vt) vt.finished.finally(() => np.classList.remove('vt'));
+      else np.classList.remove('vt');
+    }
     if (on && lyricsOpen) { renderLyrics(true); startLyricsLoop(); }
     if (!on) cancelAnimationFrame(lyricsRaf);
   }
@@ -587,7 +610,7 @@ function restorePlayer() {
   S.shuffle = !!st.shuffle;
   S.repeat = ['off', 'all', 'one'].includes(st.repeat) ? st.repeat : 'off';
   S.source = st.source || '';
-  for (const t of st.remote || []) if (t?.id && !S.tracks.has(t.id)) remote.set(t.id, t);
+  for (const t of st.remote || []) if (t?.id && !S.tracks.has(t.id)) { remote.set(t.id, t); regAlts(t.coverId, t.coverAlts); }
   const cur = st.queue?.[st.index];
   S.queue = (st.queue || []).filter(hasT);
   S.original = (st.original || []).filter(hasT);
@@ -645,7 +668,7 @@ function setupMediaSession() {
 const artCache = new Map();
 async function artworkDataUrl(coverId) {
   if (!coverId) return null;
-  if (coverId.startsWith('url:')) return coverId.slice(4);
+  if (coverId.startsWith('url:')) return coverUrl(coverId);
   if (artCache.has(coverId)) return artCache.get(coverId);
   const rec = await db.get('covers', coverId).catch(() => null);
   if (!rec) return null;
@@ -935,7 +958,7 @@ function applyLiveCover() {
   $('#np').classList.toggle('live-on', liveCoverOn());
 }
 function colorMenu(anchor) {
-  const cur = ls.get('klang-accent', 'Koralle');
+  const cur = ls.get('klang-accent', 'Gold');
   const live = liveCoverOn();
   openMenu([
     { header: '<div><b>Farbe &amp; Live-Cover</b><span>Die Farbe gilt für Play, Fortschritt und Score-Bug</span></div>' },
@@ -1161,6 +1184,7 @@ async function setFav(id, val) {
     } else await db.put('tracks', t);
   }
   $$(`.row[data-id="${id}"] .row-fav`).forEach((b) => { b.classList.toggle('on', val); b.innerHTML = icon(val ? 'heart-fill' : 'heart'); });
+  $$(`.ft-fav[data-id="${id}"]`).forEach((b) => { b.classList.toggle('on', val); b.innerHTML = `${icon(val ? 'heart-fill' : 'heart')}<span>Favorit</span>`; });
   if (id === curId) updateFavUI();
   if (parseRoute().name === 'favorites') refresh();
   toast(val ? 'Zu Favoriten hinzugefügt' : 'Aus Favoriten entfernt', 1600);
@@ -1514,16 +1538,36 @@ function playButtons(k) {
     <button class="icon-btn lg" data-action="shuffle-list" data-list="${k}" title="Zufällig abspielen" aria-label="Zufällig abspielen">${icon('shuffle')}</button>`;
 }
 
+// Kino-Wand-Kachel: quadratisches Cover; in Regalen wächst sie beim Fokus und zeigt Infos
+function tile({ tag = 'a', attrs = '', cover, play = '', title, sub, info, cover1 = '' }) {
+  return `<${tag} class="card" ${attrs}>
+    <div class="card-frame">
+      <div class="card-art">${cover}${play}</div>
+      <div class="card-info" aria-hidden="true">
+        <b>${esc(info.title)}</b>
+        <span>${info.meta}</span>
+        ${info.line ? `<em>${info.line}</em>` : ''}
+        <i class="ci-play">${icon('play')}<u>${info.cta || 'Abspielen'}</u></i>
+      </div>
+    </div>
+    <div class="card-title">${title}</div>
+    <div class="card-sub">${sub}</div>${cover1}
+  </${tag}>`;
+}
 function albumCard(a) {
-  return `<a class="card" href="#/album/${encodeURIComponent(a.key)}" data-album-key="${esc(a.key)}">
-    <div class="card-art">${coverHTML(a.coverId, a.key)}<button class="card-play" data-action="play-album" data-key="${esc(a.key)}" aria-label="${esc(a.name)} abspielen">${icon('play')}</button></div>
-    <div class="card-title">${esc(a.name)}</div>
-    <div class="card-sub">${esc(a.artist)}${a.year ? ' · ' + esc(a.year) : ''}</div>
-  </a>`;
+  const dur = a.tracks.reduce((s, t) => s + (t.duration || 0), 0);
+  return tile({
+    attrs: `href="#/album/${encodeURIComponent(a.key)}" data-album-key="${esc(a.key)}" data-tint-src="${esc(a.coverId || '')}"`,
+    cover: coverHTML(a.coverId, a.key),
+    play: `<button class="card-play" data-action="play-album" data-key="${esc(a.key)}" aria-label="${esc(a.name)} abspielen">${icon('play')}</button>`,
+    title: esc(a.name),
+    sub: `${esc(a.artist)}${a.year ? ' · ' + esc(a.year) : ''}`,
+    info: { title: a.name, meta: `${esc(a.artist)}${a.year ? ' · ' + esc(a.year) : ''}`, line: `Album · ${plural(a.tracks.length, 'Titel', 'Titel')} · ${fmtLong(dur)}`, cta: 'Album öffnen' },
+  });
 }
 function artistCard(a) {
   return `<a class="card center" href="#/artist/${encodeURIComponent(a.name)}">
-    <div class="card-art">${coverHTML(a.coverId, a.name, 'round')}<button class="card-play" data-action="play-artist" data-name="${esc(a.name)}" aria-label="${esc(a.name)} abspielen">${icon('play')}</button></div>
+    <div class="card-frame"><div class="card-art">${coverHTML(a.coverId, a.name, 'round')}<button class="card-play" data-action="play-artist" data-name="${esc(a.name)}" aria-label="${esc(a.name)} abspielen">${icon('play')}</button></div></div>
     <div class="card-title">${esc(a.name)}</div>
     <div class="card-sub">${plural(a.tracks.length, 'Titel', 'Titel')}</div>
   </a>`;
@@ -1542,30 +1586,43 @@ function playlistCover(p, size = '') {
   return `<div class="cover ${cls}" style="--h:${hue(p.name)}">${icon('playlist')}</div>`;
 }
 function playlistCard(p) {
-  return `<a class="card" href="#/playlist/${p.id}">
-    <div class="card-art">${playlistCover(p)}<button class="card-play" data-action="play-playlist" data-id="${p.id}" aria-label="${esc(p.name)} abspielen">${icon('play')}</button></div>
-    <div class="card-title">${esc(p.name)}</div>
-    <div class="card-sub">Playlist · ${plural(p.trackIds.length, 'Titel', 'Titel')}</div>
-  </a>`;
+  return tile({
+    attrs: `href="#/playlist/${p.id}"`,
+    cover: playlistCover(p),
+    play: `<button class="card-play" data-action="play-playlist" data-id="${p.id}" aria-label="${esc(p.name)} abspielen">${icon('play')}</button>`,
+    title: esc(p.name),
+    sub: `Playlist · ${plural(p.trackIds.length, 'Titel', 'Titel')}`,
+    info: { title: p.name, meta: 'Playlist', line: plural(p.trackIds.length, 'Titel', 'Titel'), cta: 'Playlist öffnen' },
+  });
 }
 
 function onlineTrackCard(t, k, i) {
-  return `<div class="card" role="button" tabindex="0" data-action="play-at" data-list="${k}" data-i="${i}" data-id="${t.id}">
-    <div class="card-art">${coverHTML(t.coverId, t.title)}<span class="card-play">${icon('play')}</span></div>
-    <div class="card-title">${esc(t.title)}</div>
-    <div class="card-sub">${esc(t.artist)}</div>
-  </div>`;
+  return tile({
+    tag: 'div',
+    attrs: `role="button" tabindex="0" data-action="play-at" data-list="${k}" data-i="${i}" data-id="${t.id}" data-tint-src="${esc(t.coverId || '')}"`,
+    cover: coverHTML(t.coverId, t.title),
+    play: `<span class="card-play">${icon('play')}</span>`,
+    title: esc(t.title),
+    sub: esc(t.artist),
+    info: { title: t.title, meta: `${esc(t.artist)}${t.genre ? ' · ' + esc(t.genre.split(',')[0]) : ''}`, line: `${fmt(t.duration)}${t.plays ? ` · ${fmtCount(t.plays)} Plays` : ''}` },
+  });
 }
 function stationCard(s, k, i) {
-  return `<div class="card" role="button" tabindex="0" data-action="play-at" data-list="${k}" data-i="${i}" data-id="${s.id}">
-    <div class="card-art">${coverHTML(s.coverId, s.title, 'station-art', 'radio')}<span class="card-play">${icon('play')}</span></div>
-    <div class="card-title">${esc(s.title)}</div>
-    <div class="card-sub">${esc(s.artist)}</div>
-  </div>`;
+  return tile({
+    tag: 'div',
+    attrs: `role="button" tabindex="0" data-action="play-at" data-list="${k}" data-i="${i}" data-id="${s.id}"`,
+    cover: coverHTML(s.coverId, s.title, 'station-art', 'radio'),
+    play: `<span class="card-play">${icon('play')}</span>`,
+    title: esc(s.title),
+    sub: esc(s.artist),
+    info: { title: s.title, meta: esc(s.artist), line: '<span class="live-dot">● Live</span>', cta: 'Einschalten' },
+  });
 }
+// Top 10 wie im Kino-Streaming: riesige Ziffer neben dem Cover
+const top10Of = (ids, k) => `<div class="shelf top10">${ids.map((id, i) => `<div class="t10"><span class="t10-n" aria-hidden="true">${i + 1}</span>${onlineTrackCard(getT(id), k, i)}</div>`).join('')}</div>`;
 function oartistCard(u) {
   return `<a class="card center" href="#/oartist/${encodeURIComponent(u.id)}">
-    <div class="card-art">${coverHTML(u.pic, u.name, 'round', 'user')}</div>
+    <div class="card-frame"><div class="card-art">${coverHTML(u.pic, u.name, 'round', 'user')}</div></div>
     <div class="card-title">${esc(u.name)}${u.verified ? ` <span class="verified" title="Verifiziert">${icon('check')}</span>` : ''}</div>
     <div class="card-sub">${u.followers ? `${fmtCount(u.followers)} Follower` : 'Künstler'}</div>
   </a>`;
@@ -1627,12 +1684,11 @@ const views = {};
 const after = {};
 
 views.home = () => {
-  const hr = new Date().getHours();
-  const greet = hr < 5 ? 'Gute Nacht' : hr < 11 ? 'Guten Morgen' : hr < 18 ? 'Guten Tag' : 'Guten Abend';
-  const online = section('Tabelle der Woche', '#/discover', '<div id="home-trending"></div>')
+  const feature = `<section class="feature" id="feature" aria-label="Top-Songs der Woche"><div class="ft-tools m-only">${settingsBtn()}</div><div class="ft-stage">${featureSkeleton()}</div></section>`;
+  const online = section('Top 10 diese Woche', '#/discover', '<div id="home-top10"></div>')
     + (radioFavs().length ? section('Meine Sender', '#/radio', '<div id="home-myradio"></div>') : '')
     + section('Radio hören', '#/radio', '<div id="home-radio"></div>');
-  if (!S.tracks.size) return pageHead(greet, '', settingsBtn()) + emptyLib() + online;
+  if (!S.tracks.size) return feature + online + section('Deine Bibliothek', '', emptyLib());
   const albums = [...getAlbums().values()];
   const recent = albums.filter((a) => a.lastPlayed).sort((a, b) => b.lastPlayed - a.lastPlayed).slice(0, 14);
   const newest = albums.slice().sort((a, b) => b.addedAt - a.addedAt).slice(0, 14);
@@ -1649,18 +1705,21 @@ views.home = () => {
     ...S.playlists.slice(-2).reverse().map((p) => `<a class="tile" href="#/playlist/${p.id}">${playlistCover(p, 'mini').replace('class="cover', 'class="cover tile-art')}<span class="tile-label"><span>${esc(p.name)}</span><small>Playlist</small></span></a>`),
   ].join('');
 
-  let html = pageHead(greet, '', settingsBtn()) + `<div class="tiles">${tiles}</div>`;
-  if (recent.length) html += section('Zuletzt gespielt', '#/albums', `<div class="shelf">${recent.map(albumCard).join('')}</div>`);
+  let html = feature + `<div class="tiles">${tiles}</div>`;
+  if (recent.length) html += section('Weiterhören', '#/albums', `<div class="shelf">${recent.map(albumCard).join('')}</div>`);
+  html += online.split('</section>')[0] + '</section>';
   if (top.length) { const k = regList(top.map((t) => t.id), { source: 'Meistgespielt', noHead: true }); html += section('Deine Top-Titel', '', listEl(k, false)); }
-  html += section('Neu hinzugefügt', '#/albums', `<div class="shelf">${newest.map(albumCard).join('')}</div>`);
+  html += section('Neu in deiner Bibliothek', '#/albums', `<div class="shelf">${newest.map(albumCard).join('')}</div>`);
   if (artists.length > 1) html += section('Deine Künstler', '#/artists', `<div class="shelf">${artists.map(artistCard).join('')}</div>`);
-  return html + online;
+  return html + online.split('</section>').slice(1).join('</section>');
 };
 after.home = () => {
-  fillAsync('#home-trending', async () => {
-    const ids = adopt(await cached('trend:all:week', () => audius.trending(null, 'week', 50)));
-    const k = regList(ids.slice(0, 5), { source: 'Tabelle der Woche', rank: true, noHead: true });
-    return listEl(k, false);
+  const trending = cached('trend:all:week', () => audius.trending(null, 'week', 50));
+  trending.then((list) => mountFeature(adopt(list), 'Top der Woche')).catch(() => featureOffline());
+  fillAsync('#home-top10', async () => {
+    const ids = adopt(await trending);
+    const k = regList(ids.slice(0, 10), { source: 'Top 10 diese Woche' });
+    return top10Of(ids.slice(0, 10), k);
   });
   const my = $('#home-myradio');
   if (my) {
@@ -1687,24 +1746,28 @@ const TIMES = [['week', 'Diese Woche'], ['month', 'Dieser Monat'], ['year', 'Die
 
 views.discover = () => {
   const chips = GENRES.map(([k, l]) => `<button class="chip ${k === S.discGenre ? 'on' : ''}" data-action="disc-genre" data-genre="${k}">${l}</button>`).join('');
-  return discTabs('discover') + pageHead('Entdecken', 'Vollständige Songs, kostenlos und legal, direkt von den Künstlern')
-    + `<div class="chips wrap">${chips}</div><div id="disc-content"></div>`
+  return `<section class="feature" id="feature" aria-label="Angesagt"><div class="ft-tools">${discTabs('discover')}</div><div class="ft-stage">${featureSkeleton()}</div></section>`
+    + `<div class="chips wrap disc-chips">${chips}</div><div id="disc-content"></div>`
     + '<p class="attribution">Musik über <a href="https://audius.co" target="_blank" rel="noopener">Audius</a>: Künstler laden ihre Songs dort selbst hoch und geben sie zum Streamen frei.</p>';
 };
 after.discover = () => fillAsync('#disc-content', async () => {
   const g = GENRES.find((x) => x[0] === S.discGenre) || GENRES[0];
   const tracks = await cached(`trend:${g[0]}:${S.discTime}`, () => audius.trending(g[2], S.discTime, 60));
-  if (!tracks.length) return '<div class="empty-small">Hier ist gerade nichts im Trend. Probier ein anderes Genre.</div>';
+  if (!tracks.length) { featureOffline('Hier ist gerade nichts im Trend.'); return '<div class="empty-small">Hier ist gerade nichts im Trend. Probier ein anderes Genre.</div>'; }
   const ids = adopt(tracks);
+  mountFeature(ids, `Angesagt · ${g[1]}`);
+  const k10 = regList(ids.slice(0, 10), { source: `Top 10 · ${g[1]}` });
   const k = regList(ids, { source: `Angesagt · ${g[1]}`, rank: true });
+  const shelf10 = section(`Top 10 · ${g[1]}`, '', top10Of(ids.slice(0, 10), k10));
   const users = [];
   const seen = new Set();
   for (const t of tracks) {
     if (t.artistId && !seen.has(t.artistId)) { seen.add(t.artistId); users.push({ id: t.artistId, name: t.artist, pic: t.artistPic, verified: t.artistVerified, followers: t.artistFollowers }); }
   }
   const timeSel = `<select class="select" data-change="disc-time" aria-label="Zeitraum">${TIMES.map(([v, l]) => `<option value="${v}" ${v === S.discTime ? 'selected' : ''}>${l}</option>`).join('')}</select>`;
-  return `<div class="actions-bar">${playButtons(k)}<span style="flex:1"></span>${timeSel}</div>`
-    + section('Tabelle', '', listEl(k))
+  return shelf10
+    + `<div class="actions-bar">${playButtons(k)}<span style="flex:1"></span>${timeSel}</div>`
+    + section('Die ganze Tabelle', '', listEl(k))
     + section('Künstler im Trend', '', `<div class="shelf">${users.slice(0, 14).map(oartistCard).join('')}</div>`);
 });
 
@@ -1741,6 +1804,7 @@ after.radio = () => fillAsync('#radio-grid', async () => {
 views.oartist = () => '<div id="oartist-wrap"></div>';
 after.oartist = (id) => fillAsync('#oartist-wrap', async () => {
   const [u, tracks] = await Promise.all([cached(`u:${id}`, () => audius.user(id)), cached(`ut:${id}`, () => audius.userTracks(id))]);
+  regAlts(u.pic, u.picAlts);
   const ids = adopt(tracks);
   const k = regList(ids, { source: u.name });
   const total = tracks.reduce((s, t) => s + (t.duration || 0), 0);
@@ -1841,8 +1905,8 @@ views.favorites = () => {
 
 views.playlists = () => {
   const cards = [
-    `<button class="card card-new" data-action="new-playlist" style="text-align:left"><div class="card-art"><div class="cover">${icon('plus')}</div></div><div class="card-title">Neue Playlist</div><div class="card-sub">Erstellen</div></button>`,
-    `<a class="card" href="#/favorites"><div class="card-art"><div class="cover fav-art">${icon('heart-fill')}</div><button class="card-play" data-action="play-favs" aria-label="Favoriten abspielen">${icon('play')}</button></div><div class="card-title">Favoriten</div><div class="card-sub">${plural([...S.tracks.values()].filter((t) => t.fav).length, 'Titel', 'Titel')}</div></a>`,
+    `<button class="card card-new" data-action="new-playlist" style="text-align:left"><div class="card-frame"><div class="card-art"><div class="cover">${icon('plus')}</div></div></div><div class="card-title">Neue Playlist</div><div class="card-sub">Erstellen</div></button>`,
+    `<a class="card" href="#/favorites"><div class="card-frame"><div class="card-art"><div class="cover fav-art">${icon('heart-fill')}</div><button class="card-play" data-action="play-favs" aria-label="Favoriten abspielen">${icon('play')}</button></div></div><div class="card-title">Favoriten</div><div class="card-sub">${plural([...S.tracks.values()].filter((t) => t.fav).length, 'Titel', 'Titel')}</div></a>`,
     ...S.playlists.slice().sort((a, b) => b.updatedAt - a.updatedAt).map(playlistCard),
   ];
   return pageHead('Playlists', plural(S.playlists.length, 'Playlist', 'Playlists'), settingsBtn()) + `<div class="grid">${cards.join('')}</div>`;
@@ -1915,6 +1979,7 @@ function renderSearch() {
     if (token !== searchToken || !el.isConnected) return;
     if (!ot && !ou && !os) { el.innerHTML = offlineHTML(); return; }
     let out = '';
+    ou?.forEach((u) => regAlts(u.pic, u.picAlts));
     if (ou?.length) out += section('Künstler online', '', `<div class="shelf">${ou.map(oartistCard).join('')}</div>`);
     if (ot?.length) { const k = regList(adopt(ot), { source: `Suche: ${raw}` }); out += section('Songs online', '', listEl(k)); }
     if (os?.length) { const ids = adopt(os.slice(0, 16)); const k = regList(ids, { source: 'Radio' }); out += section('Radiosender', '', shelfOf(ids, k, stationCard)); }
@@ -1933,11 +1998,11 @@ const ACCENTS = [
   { name: 'Mint', a: '#2dd4a7', b: '#0ea5e9', on: '#06221b' },
   { name: 'Pink', a: '#f472b6', b: '#a855f7', on: '#fff' },
   { name: 'Blau', a: '#4f9dff', b: '#4f46e5', on: '#fff' },
-  { name: 'Gold', a: '#fbbf24', b: '#f97316', on: '#241600' },
+  { name: 'Gold', a: '#e9b44c', b: '#c98a2b', on: '#17120a' },
   { name: 'Grün', a: '#4ade80', b: '#16a34a', on: '#052e12' },
 ];
 function applyAccent(name) {
-  const a = ACCENTS.find((x) => x.name === name) || ACCENTS[0];
+  const a = ACCENTS.find((x) => x.name === name) || ACCENTS.find((x) => x.name === 'Gold');
   const r = document.documentElement.style;
   r.setProperty('--accent', a.a);
   r.setProperty('--accent-2', a.b);
@@ -1947,7 +2012,7 @@ function applyAccent(name) {
 views.settings = () => {
   const tracks = [...S.tracks.values()];
   const size = tracks.reduce((s, t) => s + (t.size || 0), 0);
-  const accent = ls.get('klang-accent', 'Koralle');
+  const accent = ls.get('klang-accent', 'Gold');
   const folder = finePointer() && 'webkitdirectory' in document.createElement('input');
   const ios = /iphone|ipad|ipod/i.test(navigator.userAgent);
   const standalone = matchMedia('(display-mode: standalone)').matches || navigator.standalone;
@@ -2022,6 +2087,149 @@ after.settings = async () => {
 };
 
 /* =========================================================
+   Kino-Bewegung: GSAP, Lenis, View Transitions
+   ========================================================= */
+const reducedMotion = () => matchMedia('(prefers-reduced-motion: reduce)').matches;
+const motionOK = () => !reducedMotion() && !!window.gsap;
+let lenis = null;
+function setupMotion() {
+  if (!window.gsap) return;
+  if (window.ScrollTrigger) gsap.registerPlugin(ScrollTrigger);
+  if (window.SplitText) gsap.registerPlugin(SplitText);
+  // Weiches Scrollen nur mit Maus und ohne „Bewegung reduzieren“
+  if (window.Lenis && finePointer() && !reducedMotion()) {
+    lenis = new Lenis({ wrapper: $('#main'), content: $('#view'), lerp: 0.11, smoothWheel: true, wheelMultiplier: 0.95 });
+    if (window.ScrollTrigger) lenis.on('scroll', ScrollTrigger.update);
+    gsap.ticker.add((t) => lenis.raf(t * 1000));
+    gsap.ticker.lagSmoothing(0);
+  }
+}
+function scrollMainTo(y) {
+  if (lenis) lenis.scrollTo(y, { immediate: true, force: true });
+  else $('#main').scrollTop = y;
+}
+// Seitenwechsel als kurzer Kino-Schnitt (View Transitions), sonst sofort
+function withTransition(kind, fn) {
+  if (!document.startViewTransition || reducedMotion() || document.hidden) { fn(); return null; }
+  document.documentElement.dataset.vt = kind;
+  const vt = document.startViewTransition(fn);
+  vt.finished.finally(() => { delete document.documentElement.dataset.vt; });
+  return vt;
+}
+
+// ---- Ambient-Licht: der Bildschirm übernimmt die Farbe des gezeigten Covers ----
+let ambTimer = 0;
+function setAmbient(coverId) {
+  clearTimeout(ambTimer);
+  ambTimer = setTimeout(async () => {
+    const c = coverId ? await tintOf(coverId) : null;
+    document.documentElement.style.setProperty('--amb', c || 'rgba(0,0,0,0)');
+  }, 90);
+}
+
+// ---- Hero „Feature“: die Top-Songs im Kino-Format, wechselt alle 9 Sekunden ----
+const feat = { ids: [], k: null, i: 0, timer: 0, paused: false, hover: false, seq: 0 };
+const featureSkeleton = () => `<div class="ft-slide ft-skel"><div class="ft-body"><div class="ft-copy"><span class="sk sk-t"></span><span class="sk sk-t2"></span><span class="sk sk-m"></span></div><div class="ft-art"><div class="cover"></div></div></div></div>`;
+function featureOffline(msg) {
+  const stage = $('#feature .ft-stage');
+  if (stage) stage.innerHTML = `<div class="ft-slide"><div class="ft-body"><div class="ft-copy"><h1 class="ft-title">Klang</h1><p class="ft-meta">${esc(msg || (navigator.onLine ? 'Der Online-Katalog ist gerade nicht erreichbar.' : 'Offline: deine eigene Musik läuft trotzdem.'))}</p></div></div></div>`;
+}
+const heroCover = (t) => t.coverHi || t.coverId;
+async function mountFeature(ids, source) {
+  const el = $('#feature');
+  if (!el || !ids.length) return;
+  clearInterval(feat.timer);
+  const seq = renderSeq;
+  // Nur Songs mit ladbarem Cover kommen in den Hero (Platzierung bleibt die echte)
+  const pool = ids.slice(0, 12);
+  const ok = await Promise.all(pool.map((id) => { const t = getT(id); return heroCover(t) ? coverUrl(heroCover(t)) : null; }));
+  if (seq !== renderSeq || !$('#feature')) return;
+  const picked = pool.map((id, i) => ({ id, rank: i })).filter((x, i) => ok[i]).slice(0, 5);
+  if (!picked.length) picked.push(...pool.slice(0, 5).map((id, i) => ({ id, rank: i })));
+  feat.ids = picked.map((x) => x.id);
+  feat.ranks = picked.map((x) => x.rank);
+  feat.k = regList(ids, { source });
+  feat.i = 0;
+  feat.seq = renderSeq;
+  const nav = `<div class="ft-nav">${feat.ids.map((id, i) => `<button class="ft-dot" data-action="feat-go" data-i="${i}" aria-label="Song ${i + 1} zeigen"><i></i></button>`).join('')}
+    <button class="icon-btn sm ft-pause" data-action="feat-pause" aria-label="Wechsel anhalten">${icon('pause')}</button></div>`;
+  el.insertAdjacentHTML('beforeend', nav);
+  el.addEventListener('mouseenter', () => { feat.hover = true; });
+  el.addEventListener('mouseleave', () => { feat.hover = false; });
+  document.fonts.ready.then(() => { if (feat.seq === renderSeq) showFeature(0); });
+  if (!reducedMotion()) feat.timer = setInterval(() => {
+    if (feat.seq !== renderSeq || !$('#feature')) { clearInterval(feat.timer); return; }
+    if (feat.paused || feat.hover || document.hidden || overlays.length) return;
+    if ($('#main').scrollTop > $('#feature').offsetHeight * 0.8) return;
+    showFeature((feat.i + 1) % feat.ids.length);
+  }, 9000);
+  if (motionOK() && window.ScrollTrigger) {
+    gsap.to('#feature .ft-stage', { yPercent: 14, ease: 'none', scrollTrigger: { trigger: '#feature', scroller: '#main', start: 'top top', end: 'bottom top', scrub: true } });
+    gsap.to('#feature .ft-nav', { opacity: 0, ease: 'none', scrollTrigger: { trigger: '#feature', scroller: '#main', start: 'top top', end: '40% top', scrub: true } });
+  }
+}
+function featureHTML(t, i) {
+  const art = t.artistId ? `<a class="link" href="#/oartist/${encodeURIComponent(t.artistId)}">${esc(t.artist)}</a>` : esc(t.artist);
+  const genre = t.genre ? ` · ${esc(t.genre.split(',')[0])}` : '';
+  const rank = feat.ranks?.[i] ?? i;
+  return `<div class="ft-slide" data-i="${i}">
+    <div class="ft-bg"></div>
+    <div class="ft-body">
+      <div class="ft-copy">
+        <h1 class="ft-title ${t.title.length > 26 ? 'long' : ''}">${esc(t.title)}</h1>
+        <p class="ft-meta"><span class="ft-rank">Platz ${rank + 1}</span>${art}${genre} · ${fmt(t.duration)}</p>
+        <div class="ft-actions">
+          <button class="btn-cta" data-action="play-at" data-list="${feat.k}" data-i="${rank}">${icon('play')}<span>Jetzt abspielen</span></button>
+          <button class="btn btn-ghost ft-fav ${t.fav ? 'on' : ''}" data-action="fav" data-id="${t.id}" aria-label="Favorit">${icon(t.fav ? 'heart-fill' : 'heart')}<span>Favorit</span></button>
+        </div>
+      </div>
+      <div class="ft-art">${coverHTML(heroCover(t), t.title)}</div>
+    </div>
+  </div>`;
+}
+async function showFeature(i) {
+  const stage = $('#feature .ft-stage');
+  const t = getT(feat.ids[i]);
+  if (!stage || !t) return;
+  feat.i = i;
+  const old = [...stage.children];
+  stage.insertAdjacentHTML('beforeend', featureHTML(t, i));
+  const slide = stage.lastElementChild;
+  hydrateCovers(slide);
+  loadCover(slide.querySelector('.ft-art .cover'));
+  const bg = slide.querySelector('.ft-bg');
+  if (t.coverId) coverUrl(t.coverId).then((u) => { if (u) bg.style.backgroundImage = `url("${u.replace(/"/g, '%22')}")`; });
+  regAlts(heroCover(t), t.coverHiAlts);
+  $$('#feature .ft-dot').forEach((d, j) => d.classList.toggle('on', j === i));
+  setAmbient(t.coverId);
+  if (!motionOK()) { old.forEach((o) => o.remove()); return; }
+  const tl = gsap.timeline();
+  tl.fromTo(slide, { opacity: 0 }, { opacity: 1, duration: 0.9, ease: 'power2.out' }, 0);
+  if (old.length) tl.to(old, { opacity: 0, duration: 0.7, ease: 'power2.out', onComplete: () => old.forEach((o) => o.remove()) }, 0);
+  const title = slide.querySelector('.ft-title');
+  if (window.SplitText) {
+    const split = SplitText.create(title, { type: 'lines,words,chars', mask: 'lines', linesClass: 'ft-line' });
+    tl.from(split.chars, { yPercent: 118, duration: 1.05, ease: 'expo.out', stagger: { each: 0.022, from: 'start' } }, 0.08);
+  }
+  tl.from(slide.querySelectorAll('.ft-meta, .ft-actions'), { y: 22, opacity: 0, duration: 0.8, ease: 'expo.out', stagger: 0.09 }, 0.32);
+  tl.from(slide.querySelector('.ft-art'), { scale: 0.86, rotate: -2.5, opacity: 0, duration: 1.3, ease: 'expo.out' }, 0.04);
+  gsap.fromTo(bg, { scale: 1.22 }, { scale: 1.04, duration: 11, ease: 'none' });
+  // Fortschrittsbalken im aktiven Punkt
+  $$('#feature .ft-dot i').forEach((b) => { gsap.killTweensOf(b); b.style.setProperty('--p', 1); });
+  const bar = $('#feature .ft-dot.on i');
+  if (bar && !feat.paused) gsap.fromTo(bar, { '--p': 0 }, { '--p': 1, duration: 9, ease: 'none' });
+}
+
+// ---- Kacheln: beim Draufzeigen fließt das Ambient-Licht in der Coverfarbe ----
+function setupWallHover() {
+  if (!finePointer()) return;
+  $('#view').addEventListener('pointerover', (e) => {
+    const card = e.target.closest('.shelf .card[data-tint-src]');
+    if (card && card.dataset.tintSrc) setAmbient(card.dataset.tintSrc);
+  });
+}
+
+/* =========================================================
    Router
    ========================================================= */
 function parseRoute() {
@@ -2045,14 +2253,19 @@ function render(keepScroll = false) {
   const top = main.scrollTop;
   lists = {};
   renderSeq++;
+  clearInterval(feat.timer);
+  if (window.ScrollTrigger) ScrollTrigger.getAll().forEach((st) => st.kill());
   const view = $('#view');
   view.innerHTML = fn(r.arg);
+  document.body.dataset.route = r.name;
+  if (!['home', 'discover'].includes(r.name)) setAmbient(null);
   mountLists(view);
   hydrateCovers(view);
   applyTints(view);
   after[r.name]?.(r.arg);
   updateNav(r.name);
-  main.scrollTop = keepScroll ? top : 0;
+  scrollMainTo(keepScroll ? top : 0);
+  if (window.ScrollTrigger) requestAnimationFrame(() => ScrollTrigger.refresh());
 }
 function refresh() {
   if (parseRoute().name === 'search') renderSearch();
@@ -2161,6 +2374,14 @@ const actions = {
     if (parseRoute().name === 'radio') render(true); else go('radio');
   },
   retry: () => { apiCache.clear(); refresh(); },
+  'feat-go': (el) => { if (+el.dataset.i !== feat.i) showFeature(+el.dataset.i); },
+  'feat-pause': (el) => {
+    feat.paused = !feat.paused;
+    el.innerHTML = icon(feat.paused ? 'play' : 'pause');
+    el.setAttribute('aria-label', feat.paused ? 'Wechsel fortsetzen' : 'Wechsel anhalten');
+    const bar = $('#feature .ft-dot.on i');
+    if (bar && window.gsap) { gsap.killTweensOf(bar); bar.style.setProperty('--p', 1); }
+  },
   'album-menu': (el) => albumMenu(el.dataset.key, el),
   'playlist-menu': (el) => playlistMenu(el.dataset.id, el),
   'new-playlist': async () => { const p = await newPlaylistFlow(); if (p) go('playlist', p.id); },
@@ -2391,7 +2612,7 @@ function setupEvents() {
 
   window.addEventListener('pagehide', saveState);
   document.addEventListener('visibilitychange', () => { if (document.hidden) saveState(); });
-  window.addEventListener('hashchange', () => { closeMenu(); render(); });
+  window.addEventListener('hashchange', () => { closeMenu(); withTransition('route', () => render()); });
 }
 
 /* =========================================================
@@ -2432,7 +2653,7 @@ function setupLaunchQueue() {
    ========================================================= */
 async function init() {
   hydrateIcons(document);
-  applyAccent(ls.get('klang-accent', 'Koralle'));
+  applyAccent(ls.get('klang-accent', 'Gold'));
   cacheNpEls();
   applyLiveCover();
   updateVolumeUI();
@@ -2440,14 +2661,16 @@ async function init() {
   updatePlayState();
   try {
     const [tracks, playlists, ckeys] = await Promise.all([db.getAll('tracks'), db.getAll('playlists'), db.getAllKeys('covers')]);
-    tracks.forEach((t) => S.tracks.set(t.id, t));
+    tracks.forEach((t) => { S.tracks.set(t.id, t); regAlts(t.coverId, t.coverAlts); });
     S.playlists = playlists;
     coverKeys = new Set(ckeys);
   } catch (e) {
     console.error(e);
     toast('Die Bibliothek konnte nicht geladen werden. Ist der private Modus aktiv?', 6000);
   }
+  setupMotion();
   setupEvents();
+  setupWallHover();
   setupMediaSession();
   renderSidebarPlaylists();
   render();
