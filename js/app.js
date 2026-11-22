@@ -2337,7 +2337,7 @@ function trackMenu(id, anchor, ctx = {}) {
     }
   }
   items.push({ sep: true }, { label: t.lyrics ? 'Songtext bearbeiten' : 'Songtext hinzufügen', icon: 'lyrics', fn: () => editLyrics(id) });
-  if (ctx.np) items.push({ label: 'Farbe & Live-Cover', icon: 'palette', fn: () => colorMenu(anchor) }, { label: eq.on ? 'Equalizer (an)' : 'Equalizer', icon: 'equalizer', fn: () => eqDialog() });
+  if (ctx.np) items.push({ label: eq.on ? 'Equalizer (an)' : 'Equalizer', icon: 'equalizer', fn: () => eqDialog() }, { label: S.sleep ? 'Sleep-Timer (an)' : 'Sleep-Timer', icon: 'moon', fn: () => sleepMenu(anchor) }, { label: 'Farbe & Live-Cover', icon: 'palette', fn: () => colorMenu(anchor) });
   if (!isOnline(t)) items.push({ label: 'Infos bearbeiten', icon: 'edit', fn: () => editTrack(id) });
   if (S.tracks.has(id)) {
     if (isOnline(t)) items.push({ sep: true });
@@ -4657,12 +4657,24 @@ async function prefetchNext() {
 const canAirPlay = () => typeof audio.webkitShowPlaybackTargetPicker === 'function';
 const canSink = () => typeof HTMLMediaElement.prototype.setSinkId === 'function';
 async function pickOutput() {
-  if (canAirPlay()) {
-    // Mit Equalizer läuft der Ton durch Web Audio, das kann iOS nicht an AirPlay/Bluetooth-Boxen schicken
-    if (eq.on && isEqEl(audio)) { setEqOn(false); toast('Equalizer ist für AirPlay ausgeschaltet. Tippe nochmal auf das Gerät-Symbol.', 4000); return; }
-    if (!curId) { toast('Starte zuerst einen Song, dann das Gerät wählen.'); return; }
-    if (deferred || audio.paused) togglePlay();
-    try { audio.webkitShowPlaybackTargetPicker(); } catch { /* */ }
+  if (canAirPlay() || /iphone|ipad|ipod/i.test(navigator.userAgent)) {
+    if (eq.on && isEqEl(audio)) setEqOn(false); // Equalizer-Ton kann iOS nicht an andere Geräte schicken
+    const r = await openDialog({
+      title: 'Auf anderem Gerät hören',
+      body: `<div class="dev-list">
+        <div class="dev"><span class="dev-ic">${icon('volume')}</span><div><b>Alexa / Echo</b><ol>
+          <li>Zum Echo sagen: <b>„Alexa, koppeln“</b>.</li>
+          <li>iPhone: <b>Einstellungen → Bluetooth</b> → deinen Echo antippen.</li>
+          <li>Fertig: VERS spielt jetzt über Alexa. „Alexa, trennen“ beendet es.</li></ol></div></div>
+        <div class="dev"><span class="dev-ic">${icon('airplay')}</span><div><b>AirPods &amp; Bluetooth-Boxen</b><p>Einmal in <b>Einstellungen → Bluetooth</b> verbinden. Danach wählt das iPhone sie automatisch, oder du wechselst im Kontrollzentrum oben rechts beim Musik-Feld.</p></div></div>
+        <div class="dev"><span class="dev-ic">${icon('airplay')}</span><div><b>AirPlay (Apple TV, Sonos, HomePod)</b><p>Liste unten öffnen und Gerät antippen.</p></div></div>
+      </div>`,
+      buttons: [{ label: 'Schließen' }, ...(canAirPlay() ? [{ label: 'AirPlay-Liste', primary: true, value: 'air' }] : [])],
+    });
+    if (r?.value === 'air') {
+      if (deferred || audio.paused) togglePlay();
+      try { audio.webkitShowPlaybackTargetPicker(); } catch { /* */ }
+    }
     return;
   }
   if (navigator.mediaDevices?.selectAudioOutput) {

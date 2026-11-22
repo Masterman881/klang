@@ -1443,3 +1443,24 @@ html { background: var(--bg); }
 /* Login: Cover-Wand und Abdunklung reichen über den ganzen Bildschirm (auch unter dem Home-Strich am iPhone) */
 .auth-shade { inset: -25% -10%; }
 .auth-wall { -webkit-mask-image: linear-gradient(to bottom, #000 0%, #000 55%, transparent 88%); mask-image: linear-gradient(to bottom, #000 0%, #000 55%, transparent 88%); }
+
+/* Vollbild-Player am Handy: kompakter, nur das Wichtige (wie ein Musik-Player) */
+@media (max-width: 860px) {
+  .np-src small { display: none; }
+  .np-src span { font-size: 13px; font-weight: 500; color: var(--muted); }
+  .np-head-r [data-action="output"], .np-head-r [data-action="eq"] { display: none; }
+  .np-extra { justify-content: space-around; margin-top: 10px; }
+  .np-extra [data-action="sleep"] { display: none; }
+  .np-extra .pill-btn { min-width: 64px; justify-content: center; padding: 0 12px; }
+  .np-extra .pill-btn span { display: none; }
+  .np-extra .pill-btn .ic { width: 22px; height: 22px; }
+  .np-extra .pill-btn.on { color: var(--accent); }
+}
+@media (min-width: 861px) { .np-dev { display: none; } }
+.dev-list { display: flex; flex-direction: column; gap: 16px; }
+.dev { display: grid; grid-template-columns: 40px minmax(0, 1fr); gap: 12px; }
+.dev-ic { width: 40px; height: 40px; border-radius: 50%; display: grid; place-items: center; background: var(--surface3); color: var(--accent); }
+.dev-ic .ic { width: 20px; height: 20px; }
+.dev b { font-weight: 600; }
+.dev p, .dev ol { margin: 4px 0 0; color: var(--muted); font-size: 14px; line-height: 1.45; }
+.dev ol { padding-left: 18px; }
