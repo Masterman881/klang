@@ -455,7 +455,7 @@ async function loadAndPlay(autoplay = true, startAt = 0) {
       updatePlayerUI(); updateMediaSession(); markPlaying(); updatePlayState(); updateProgress();
       return;
     }
-    if (!navigator.onLine) toast('Keine Internetverbindung – Online-Titel brauchen Internet.', 3500);
+    if (t.remote !== 'server' && !navigator.onLine) toast('Keine Internetverbindung – Online-Titel brauchen Internet.', 3500);
     src = t.streamUrl;
   } else {
     let rec = null;
@@ -2454,6 +2454,7 @@ const listOf = (el) => lists[el.dataset.list];
 const actions = {
   'import-files': () => { $('#file-input').value = ''; $('#file-input').click(); },
   'import-folder': () => { $('#folder-input').value = ''; $('#folder-input').click(); },
+  'reload-server-lib': () => loadServerLibrary(true),
   toggle: () => togglePlay(),
   next: () => next(),
   prev: () => prev(),
@@ -2852,6 +2853,52 @@ function setupLaunchQueue() {
 /* =========================================================
    Start
    ========================================================= */
+/* =========================================================
+   Server-Bibliothek (Musik aus Downloads/music)
+   ========================================================= */
+async function loadServerLibrary(showToast = false) {
+  let list;
+  try {
+    const r = await fetch('/api/music');
+    if (!r.ok) return;
+    list = await r.json();
+  } catch { return; } // Server nicht verfügbar
+
+  if (!list || !list.length) return;
+
+  let added = 0;
+  for (const item of list) {
+    const id = 'srv:' + item.url;
+    if (S.tracks.has(id)) continue;
+    const title = item.file.replace(/\.[^.]+$/, '');
+    const track = {
+      id,
+      remote: 'server',
+      streamUrl: item.url,
+      title,
+      artist: item.artist || 'Unbekannter Künstler',
+      album: item.artist || 'Lokale Musik',
+      albumArtist: item.artist || '',
+      year: '', genre: '',
+      trackNo: 0, discNo: 0,
+      duration: 0,
+      fileName: item.file, size: 0,
+      coverId: null,
+      fav: false, favAt: 0, playCount: 0, lastPlayed: 0,
+      addedAt: Date.now(),
+    };
+    S.tracks.set(id, track);
+    try { await db.put('tracks', track); } catch { /* */ }
+    added++;
+  }
+
+  if (added > 0) {
+    invalidate();
+    refresh();
+    if (showToast) toast(`${plural(added, 'Titel', 'Titel')} aus Musik-Ordner geladen`, 3000);
+  }
+}
+
 async function init() {
   hydrateIcons(document);
   applyAccent(ls.get('klang-accent', 'Gold'));
@@ -2880,6 +2927,8 @@ async function init() {
   restorePlayer();
   setupLaunchQueue();
   registerSW();
+  // Musik-Ordner automatisch laden
+  loadServerLibrary(false);
 }
 
 init();
