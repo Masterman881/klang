@@ -4404,6 +4404,23 @@ async function phoneConnect(forceLan = false) {
   });
 }
 
+// iPhone-Startbildschirm-App: Safari meldet dort oft eine zu kleine Höhe (Statusleiste und Home-Strich
+// werden abgezogen). Dann die volle Bildschirmhöhe nehmen, damit unten kein schwarzer Streifen bleibt.
+function fitStandalone() {
+  const ios = /iphone|ipod|ipad/i.test(navigator.userAgent) || (navigator.maxTouchPoints > 1 && /mac/i.test(navigator.platform || ''));
+  const standalone = navigator.standalone || matchMedia('(display-mode: standalone)').matches;
+  const root = document.documentElement.style;
+  if (!ios || !standalone) { root.removeProperty('--app-h'); return; }
+  const portrait = matchMedia('(orientation: portrait)').matches;
+  const full = portrait ? Math.max(screen.width, screen.height) : Math.min(screen.width, screen.height);
+  const h = Math.max(innerHeight, document.documentElement.clientHeight, full);
+  root.setProperty('--app-h', h + 'px');
+}
+fitStandalone();
+addEventListener('resize', fitStandalone);
+addEventListener('orientationchange', () => setTimeout(fitStandalone, 300));
+addEventListener('pageshow', fitStandalone);
+
 async function init() {
   hydrateIcons(document);
   applyTheme();
