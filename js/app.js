@@ -1720,7 +1720,8 @@ function syncLyrics(jump = false) {
   const el = box.querySelector(`[data-i="${i}"]`);
   if (el) el.classList.add('on');
   if (Date.now() - lyricsUserScroll > 4000) {
-    const target = el ? el.offsetTop - box.clientHeight * 0.38 : 0;
+    // Aktuelle Zeile gut lesbar ins obere Drittel, darüber bleiben die letzten Zeilen sichtbar
+    const target = el ? box.scrollTop + (el.getBoundingClientRect().top - box.getBoundingClientRect().top) - box.clientHeight * 0.36 + el.offsetHeight / 2 : 0;
     box.scrollTo({ top: Math.max(0, target), behavior: jump || matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' });
   }
 }
