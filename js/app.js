@@ -55,6 +55,8 @@ const S = {
   search: '',
   sort: ls.get('klang-sort', { songs: 'title', albums: 'name' }),
   lastLib: 'songs',
+  smart: false, // Smart Shuffle
+  recs: new Set(), // eingemischte Empfehlungen
   discGenre: 'all',
   discTime: 'week',
   radioCat: 'top',
@@ -441,8 +443,14 @@ window.addEventListener('popstate', () => {
 /* =========================================================
    Player
    ========================================================= */
-const audio = new Audio();
-audio.preload = 'auto';
+// Zwei Abspieler: einer direkt (geht immer, auch im Hintergrund auf dem iPhone),
+// einer durch den Equalizer (braucht CORS-Freigabe der Quelle). `audio` zeigt auf den aktiven.
+const plainEl = new Audio();
+const eqEl = new Audio();
+eqEl.crossOrigin = 'anonymous';
+plainEl.preload = eqEl.preload = 'auto';
+let audio = plainEl;
+const noCors = new Set(); // Quellen ohne Freigabe: laufen ohne Equalizer
 let audioUrl = null;
 let curId = null;
 let loadToken = 0;
@@ -452,11 +460,14 @@ let seeking = false;
 let lastSave = 0;
 
 let deferred = null; // Online-Titel nach Neustart erst beim Antippen laden
+let reloadOnly = false;
 
 async function loadAndPlay(autoplay = true, startAt = 0) {
   const id = S.queue[S.index];
   const t = getT(id);
   if (!t) return;
+  const counts = !reloadOnly;
+  reloadOnly = false;
   const token = ++loadToken;
   wantPlay = autoplay;
   deferred = null;
@@ -484,13 +495,18 @@ async function loadAndPlay(autoplay = true, startAt = 0) {
   if (audioUrl) URL.revokeObjectURL(audioUrl);
   audioUrl = t.remote ? null : src;
   curId = id;
+  useElement(eq.on && !noCors.has(id) ? eqEl : plainEl);
   audio.src = src;
   if (startAt > 0) audio.addEventListener('loadedmetadata', () => { audio.currentTime = Math.min(startAt, (audio.duration || startAt + 1) - 0.5); }, { once: true });
   if (autoplay) {
+    if (audio === eqEl) eq.ctx?.resume();
     audio.play().catch((e) => { if (e.name === 'NotAllowedError') updatePlayState(); });
-    t.playCount = (t.playCount || 0) + 1;
-    t.lastPlayed = Date.now();
-    if (S.tracks.has(id)) { db.put('tracks', t); _albums = null; }
+    if (counts) {
+      t.playCount = (t.playCount || 0) + 1;
+      t.lastPlayed = Date.now();
+      if (S.tracks.has(id)) { db.put('tracks', t); _albums = null; }
+      topUpSmart();
+    }
   }
   updatePlayerUI();
   updateMediaSession();
@@ -569,7 +585,18 @@ function addToQueue(ids) {
   toast(ids.length === 1 ? 'Zur Warteschlange hinzugefügt' : `${ids.length} Titel zur Warteschlange hinzugefügt`);
 }
 
+// Drei Stufen: aus -> Zufall -> Smart Shuffle -> aus
 function toggleShuffle() {
+  if (S.shuffle && !S.smart) {
+    S.smart = true;
+    topUpSmart();
+    updateModeButtons();
+    saveState();
+    if (overlays.includes('queue')) renderQueue();
+    toast(S.recs.size ? 'Smart Shuffle an: passende Empfehlungen sind eingemischt' : 'Smart Shuffle an', 2200);
+    return;
+  }
+  if (S.smart) { S.smart = false; removeRecsAhead(); }
   S.shuffle = !S.shuffle;
   const cur = S.queue[S.index];
   if (S.queue.length) {
@@ -615,7 +642,8 @@ function saveState() {
   ls.set('klang-player', {
     queue: S.queue, original: S.original, index: S.index,
     time: curId ? audio.currentTime || 0 : 0,
-    shuffle: S.shuffle, repeat: S.repeat, source: S.source,
+    shuffle: S.shuffle, smart: S.smart, recs: [...S.recs].filter((id) => S.queue.includes(id)),
+    repeat: S.repeat, source: S.source,
     volume: audio.volume, muted: audio.muted,
     remote: [...new Set(S.queue)].filter((id) => !S.tracks.has(id) && remote.has(id)).slice(0, 400).map((id) => remote.get(id)),
   });
@@ -626,6 +654,8 @@ function restorePlayer() {
   audio.volume = Number.isFinite(st.volume) ? st.volume : 1;
   audio.muted = !!st.muted;
   S.shuffle = !!st.shuffle;
+  S.smart = S.shuffle && !!st.smart;
+  S.recs = new Set(Array.isArray(st.recs) ? st.recs : []);
   S.repeat = ['off', 'all', 'one'].includes(st.repeat) ? st.repeat : 'off';
   S.source = st.source || '';
   for (const t of st.remote || []) if (t?.id && !S.tracks.has(t.id)) { remote.set(t.id, t); regAlts(t.coverId, t.coverAlts); }
@@ -639,36 +669,331 @@ function restorePlayer() {
   if (S.index >= 0) loadAndPlay(false, cur === S.queue[S.index] ? st.time || 0 : 0);
 }
 
-// ---- Audio-Events ----
-audio.addEventListener('play', updatePlayState);
-audio.addEventListener('pause', () => { updatePlayState(); saveState(); });
-audio.addEventListener('playing', () => { errorStreak = 0; });
-audio.addEventListener('timeupdate', () => {
-  updateProgress();
-  if (Date.now() - lastSave > 4000) { lastSave = Date.now(); saveState(); }
-});
-audio.addEventListener('loadedmetadata', () => {
+// ---- Audio-Events (für beide Abspieler, wirken nur beim aktiven) ----
+function useElement(el) {
+  if (el === audio) return;
+  const old = audio;
+  el.volume = old.volume;
+  el.muted = old.muted;
+  old.pause();
+  old.removeAttribute('src');
+  old.load();
+  audio = el;
+  if (el === eqEl) ensureEqGraph();
+}
+function bindAudio(el) {
+  const on = (type, fn) => el.addEventListener(type, (e) => { if (el === audio) fn(e); });
+  on('play', updatePlayState);
+  on('pause', () => { updatePlayState(); saveState(); });
+  on('playing', () => { errorStreak = 0; });
+  on('timeupdate', () => {
+    updateProgress();
+    if (Date.now() - lastSave > 4000) { lastSave = Date.now(); saveState(); }
+  });
+  on('loadedmetadata', () => {
+    const t = getT(curId);
+    if (t && !t.live && Number.isFinite(audio.duration) && Math.abs((t.duration || 0) - audio.duration) > 1) {
+      t.duration = audio.duration;
+      if (S.tracks.has(t.id)) db.put('tracks', t);
+    }
+    updateProgress();
+    updatePosState();
+  });
+  on('ended', () => {
+    if (S.sleep?.mode === 'end') { clearSleep(); toast('Sleep-Timer: Wiedergabe beendet'); return; }
+    next(true);
+  });
+  on('error', () => {
+    if (!curId || !audio.getAttribute('src')) return;
+    const t = getT(curId);
+    // Quelle ohne CORS-Freigabe: ohne Equalizer nochmal versuchen
+    if (audio === eqEl && t?.remote && !noCors.has(t.id)) {
+      noCors.add(t.id);
+      toast('Bei dieser Quelle wirkt der Equalizer nicht. Sie läuft ohne.', 3500);
+      loadAndPlay(wantPlay, t.live ? 0 : eqEl.currentTime || 0);
+      return;
+    }
+    toast(t?.remote
+      ? `„${t.title}“ konnte nicht geladen werden${navigator.onLine ? '' : ' (keine Internetverbindung)'}.`
+      : `„${t?.title || 'Titel'}“ kann in diesem Browser nicht abgespielt werden.`, 4000);
+    if (wantPlay && ++errorStreak < 3 && S.index < S.queue.length - 1) setTimeout(() => next(true), 800);
+  });
+  on('volumechange', () => { updateVolumeUI(); });
+}
+bindAudio(plainEl);
+bindAudio(eqEl);
+// Nur für automatische Tests am eigenen PC (nicht auf der Online-Version)
+if (/^(localhost|127\.0\.0\.1)$/.test(location.hostname)) {
+  window.__klangTest = { get audio() { return audio; }, get eq() { return eq; }, get S() { return S; }, getT };
+}
+
+/* =========================================================
+   Equalizer (10 Bänder, Web Audio)
+   ========================================================= */
+const EQ_FREQS = [32, 64, 125, 250, 500, 1000, 2000, 4000, 8000, 16000];
+const EQ_PRESETS = [
+  ['flat', 'Flach', [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]],
+  ['bass', 'Bass Boost', [7, 6, 5, 3, 1, 0, 0, 0, 0, 0]],
+  ['rap', 'Rap', [6, 5, 3, 1, -1, 0, 1, 2, 2, 1]],
+  ['pop', 'Pop', [-1, 1, 3, 4, 3, 1, 0, 1, 2, 2]],
+  ['rock', 'Rock', [5, 4, 2, 0, -1, 0, 2, 3, 4, 4]],
+  ['edm', 'Elektronisch', [6, 5, 2, 0, -2, 0, 1, 3, 4, 5]],
+  ['vocal', 'Stimme', [-3, -2, -1, 1, 3, 4, 4, 3, 1, 0]],
+  ['treble', 'Höhen', [0, 0, 0, 0, 0, 1, 2, 4, 5, 6]],
+  ['night', 'Leise hören', [5, 4, 2, 0, 0, 0, 0, 1, 3, 4]],
+];
+const eqSaved = ls.get('klang-eq', null);
+const eq = {
+  on: !!eqSaved?.on,
+  gains: Array.isArray(eqSaved?.gains) && eqSaved.gains.length === 10 ? eqSaved.gains : [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+  pre: Number.isFinite(eqSaved?.pre) ? eqSaved.pre : 0,
+  preset: eqSaved?.preset || 'flat',
+  ctx: null, filters: [], preGain: null, analyser: null,
+};
+const saveEq = () => ls.set('klang-eq', { on: eq.on, gains: eq.gains, pre: eq.pre, preset: eq.preset });
+function ensureEqGraph() {
+  if (eq.ctx) return;
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC) return;
+  eq.ctx = new AC();
+  const src = eq.ctx.createMediaElementSource(eqEl);
+  eq.preGain = eq.ctx.createGain();
+  eq.filters = EQ_FREQS.map((f, i) => {
+    const b = eq.ctx.createBiquadFilter();
+    b.type = i === 0 ? 'lowshelf' : i === EQ_FREQS.length - 1 ? 'highshelf' : 'peaking';
+    b.frequency.value = f;
+    b.Q.value = 1.1;
+    return b;
+  });
+  // Begrenzer gegen Übersteuern, wenn viel angehoben wird
+  const limiter = eq.ctx.createDynamicsCompressor();
+  limiter.threshold.value = -1; limiter.knee.value = 0; limiter.ratio.value = 20; limiter.attack.value = 0.003; limiter.release.value = 0.1;
+  eq.analyser = eq.ctx.createAnalyser();
+  eq.analyser.fftSize = 2048;
+  eq.analyser.smoothingTimeConstant = 0.8;
+  let node = src.connect(eq.preGain);
+  for (const f of eq.filters) node = node.connect(f);
+  node.connect(limiter).connect(eq.analyser).connect(eq.ctx.destination);
+  eqEl.addEventListener('play', () => eq.ctx.resume());
+  applyEq();
+}
+function applyEq() {
+  if (!eq.ctx) return;
+  const t = eq.ctx.currentTime;
+  eq.filters.forEach((f, i) => f.gain.setTargetAtTime(eq.gains[i], t, 0.03));
+  eq.preGain.gain.setTargetAtTime(10 ** (eq.pre / 20), t, 0.03);
+}
+// An/Aus wechselt den Abspieler – an derselben Stelle weiter
+function setEqOn(on) {
+  eq.on = on;
+  saveEq();
+  updateEqButtons();
+  if (on) ensureEqGraph();
   const t = getT(curId);
-  if (t && !t.live && Number.isFinite(audio.duration) && Math.abs((t.duration || 0) - audio.duration) > 1) {
-    t.duration = audio.duration;
-    if (S.tracks.has(t.id)) db.put('tracks', t);
+  if (!t || deferred) return;
+  const wanted = on && !noCors.has(t.id) ? eqEl : plainEl;
+  if (wanted === audio) return;
+  const wasPlaying = !audio.paused;
+  reloadOnly = true; // gleicher Song, nur anderer Abspieler: nicht als neues Abspielen zählen
+  loadAndPlay(wasPlaying, t.live ? 0 : audio.currentTime || 0);
+}
+function updateEqButtons() {
+  $$('[data-action="eq"]').forEach((b) => b.classList.toggle('on', eq.on));
+  // Schalter im offenen Equalizer-Fenster mitziehen (z. B. wenn eine Voreinstellung ihn einschaltet)
+  $$('[data-eq-toggle]').forEach((tg) => {
+    tg.classList.toggle('on', eq.on);
+    tg.setAttribute('aria-checked', String(eq.on));
+    tg.querySelector('span').textContent = eq.on ? 'An' : 'Aus';
+  });
+}
+let eqRaf = 0;
+function eqDialog() {
+  const presetChips = EQ_PRESETS.map(([k, l]) => `<button class="chip ${eq.preset === k ? 'on' : ''}" type="button" data-eq-preset="${k}">${l}</button>`).join('') + `<span class="chip eq-custom ${eq.preset === 'custom' ? 'on' : ''}">Eigene</span>`;
+  const fmtHz = (f) => (f >= 1000 ? `${f / 1000}k` : String(f));
+  const sliders = EQ_FREQS.map((f, i) => `<label class="eq-band"><output data-eq-out="${i}">${eq.gains[i] > 0 ? '+' : ''}${eq.gains[i]}</output><input type="range" min="-12" max="12" step="1" value="${eq.gains[i]}" data-eq-band="${i}" aria-label="${fmtHz(f)} Hertz"><span>${fmtHz(f)}</span></label>`).join('');
+  openDialog({
+    title: 'Equalizer',
+    body: `<div class="eq-top">
+        <button class="eq-switch ${eq.on ? 'on' : ''}" type="button" data-eq-toggle role="switch" aria-checked="${eq.on}"><i></i><span>${eq.on ? 'An' : 'Aus'}</span></button>
+        <button class="btn btn-sm" type="button" data-eq-reset>${icon('refresh')}Zurücksetzen</button>
+      </div>
+      <div class="chips wrap eq-presets">${presetChips}</div>
+      <div class="eq-stage">
+        <canvas class="eq-canvas" width="900" height="300" aria-hidden="true"></canvas>
+        <div class="eq-bands">${sliders}
+          <label class="eq-band eq-pre"><output data-eq-out="pre">${eq.pre > 0 ? '+' : ''}${eq.pre}</output><input type="range" min="-12" max="6" step="1" value="${eq.pre}" data-eq-pre aria-label="Vorverstärker"><span>Pre</span></label>
+        </div>
+      </div>
+      <p class="small muted eq-note">Wirkt auf eigene Musik, den Musik-Ordner und Audius. Manche Radiosender erlauben keinen Equalizer, die laufen dann normal.${/iphone|ipad/i.test(navigator.userAgent) ? ' iPhone: Mit Equalizer kann die Musik bei gesperrtem Bildschirm pausieren. Für unterwegs ausschalten.' : ''}</p>`,
+    buttons: [{ label: 'Fertig', primary: true, value: 'ok' }],
+  }).then(() => cancelAnimationFrame(eqRaf));
+  const layer = $('#dialog-layer');
+  const markCustom = () => {
+    const match = EQ_PRESETS.find(([, , g]) => g.every((v, i) => v === eq.gains[i]));
+    eq.preset = match ? match[0] : 'custom';
+    layer.querySelectorAll('[data-eq-preset]').forEach((c) => c.classList.toggle('on', c.dataset.eqPreset === eq.preset));
+    layer.querySelector('.eq-custom')?.classList.toggle('on', eq.preset === 'custom');
+  };
+  const setOut = (i, v) => { const o = layer.querySelector(`[data-eq-out="${i}"]`); if (o) o.textContent = `${v > 0 ? '+' : ''}${v}`; };
+  layer.addEventListener('input', (e) => {
+    const band = e.target.closest('[data-eq-band]');
+    if (band) {
+      const i = +band.dataset.eqBand;
+      eq.gains[i] = +band.value;
+      setOut(i, eq.gains[i]);
+      if (!eq.on) setEqOn(true);
+      markCustom(); applyEq(); saveEq();
+      drawEqCurve();
+    }
+    const pre = e.target.closest('[data-eq-pre]');
+    if (pre) { eq.pre = +pre.value; setOut('pre', eq.pre); applyEq(); saveEq(); }
+  });
+  layer.addEventListener('click', (e) => {
+    const p = e.target.closest('[data-eq-preset]');
+    if (p) {
+      const preset = EQ_PRESETS.find(([k]) => k === p.dataset.eqPreset);
+      eq.gains = preset[2].slice();
+      eq.preset = preset[0];
+      layer.querySelectorAll('[data-eq-band]').forEach((s, i) => { s.value = eq.gains[i]; setOut(i, eq.gains[i]); });
+      markCustom();
+      if (!eq.on) setEqOn(true);
+      applyEq(); saveEq(); drawEqCurve();
+      return;
+    }
+    const tg = e.target.closest('[data-eq-toggle]');
+    if (tg) {
+      setEqOn(!eq.on);
+      tg.classList.toggle('on', eq.on);
+      tg.setAttribute('aria-checked', String(eq.on));
+      tg.querySelector('span').textContent = eq.on ? 'An' : 'Aus';
+      drawEqCurve();
+      return;
+    }
+    if (e.target.closest('[data-eq-reset]')) {
+      eq.gains = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]; eq.pre = 0; eq.preset = 'flat';
+      layer.querySelectorAll('[data-eq-band]').forEach((s, i) => { s.value = 0; setOut(i, 0); });
+      const preEl = layer.querySelector('[data-eq-pre]'); if (preEl) { preEl.value = 0; setOut('pre', 0); }
+      markCustom(); applyEq(); saveEq(); drawEqCurve();
+    }
+  });
+  drawEqCurve();
+}
+// Kurve der Einstellung + Live-Spektrum der Musik
+function drawEqCurve() {
+  cancelAnimationFrame(eqRaf);
+  const cv = $('#dialog-layer .eq-canvas');
+  if (!cv) return;
+  const g = cv.getContext('2d');
+  const W = cv.width, H = cv.height;
+  const accent = getComputedStyle(document.documentElement).getPropertyValue('--accent').trim() || '#e9b44c';
+  const xOf = (f) => (Math.log10(f / 20) / Math.log10(20000 / 20)) * W;
+  const spec = eq.analyser ? new Uint8Array(eq.analyser.frequencyBinCount) : null;
+  const frame = () => {
+    g.clearRect(0, 0, W, H);
+    g.strokeStyle = 'rgba(243,241,236,.08)';
+    g.lineWidth = 1;
+    for (const db of [-12, -6, 0, 6, 12]) { const y = H / 2 - (db / 12) * (H / 2 - 16); g.beginPath(); g.moveTo(0, y); g.lineTo(W, y); g.stroke(); }
+    // Spektrum (nur wenn Musik durch den Equalizer läuft)
+    if (spec && eq.on && audio === eqEl && !audio.paused) {
+      eq.analyser.getByteFrequencyData(spec);
+      const ny = eq.ctx.sampleRate / 2;
+      g.fillStyle = 'rgba(243,241,236,.10)';
+      for (let x = 0; x < W; x += 6) {
+        const f = 20 * Math.pow(1000, x / W);
+        const v = spec[Math.min(spec.length - 1, Math.round((f / ny) * spec.length))] / 255;
+        g.fillRect(x, H - v * H, 4, v * H);
+      }
+    }
+    // Einstellungskurve
+    g.beginPath();
+    for (let x = 0; x <= W; x += 4) {
+      const f = 20 * Math.pow(1000, x / W);
+      let db = 0;
+      EQ_FREQS.forEach((cf, i) => { const d = Math.log2(f / cf); db += eq.gains[i] * Math.exp(-(d * d) / 0.9); });
+      const y = H / 2 - (Math.max(-14, Math.min(14, db)) / 12) * (H / 2 - 16);
+      x === 0 ? g.moveTo(x, y) : g.lineTo(x, y);
+    }
+    g.strokeStyle = eq.on ? accent : 'rgba(243,241,236,.35)';
+    g.lineWidth = 4;
+    g.stroke();
+    EQ_FREQS.forEach((cf, i) => {
+      g.beginPath();
+      g.arc(xOf(cf), H / 2 - (eq.gains[i] / 12) * (H / 2 - 16), 7, 0, Math.PI * 2);
+      g.fillStyle = eq.on ? accent : 'rgba(243,241,236,.35)';
+      g.fill();
+    });
+    if (spec && !reducedMotion()) eqRaf = requestAnimationFrame(frame);
+  };
+  frame();
+}
+
+/* =========================================================
+   Smart Shuffle: mischt passende Empfehlungen ein
+   ========================================================= */
+const artistKeys = (t) => {
+  const parts = [t.artist, t.albumArtist || ''];
+  if (t.title.includes(' - ')) parts.push(t.title.split(' - ')[0]);
+  return [...new Set(parts.join(',').split(/\s*(?:,|&|\/|\bx\b|\bfeat\.?|\bft\.?|\bund\b)\s*/i).map((s) => s.trim().toLowerCase()).filter((s) => s.length > 1))];
+};
+function recommendFor(base, exclude) {
+  if (!base) return null;
+  const mine = new Set(artistKeys(base));
+  const now = Date.now();
+  let pool;
+  if (isOnline(base) && !base.live) {
+    pool = [...remote.values()].filter((t) => t.remote === 'audius');
+  } else {
+    pool = [...S.tracks.values()].filter((t) => !t.live);
   }
-  updateProgress();
-  updatePosState();
-});
-audio.addEventListener('ended', () => {
-  if (S.sleep?.mode === 'end') { clearSleep(); toast('Sleep-Timer: Wiedergabe beendet'); return; }
-  next(true);
-});
-audio.addEventListener('error', () => {
-  if (!curId || !audio.getAttribute('src')) return;
-  const t = getT(curId);
-  toast(t?.remote
-    ? `„${t.title}“ konnte nicht geladen werden${navigator.onLine ? '' : ' (keine Internetverbindung)'}.`
-    : `„${t?.title || 'Titel'}“ kann in diesem Browser nicht abgespielt werden.`, 4000);
-  if (wantPlay && ++errorStreak < 3 && S.index < S.queue.length - 1) setTimeout(() => next(true), 800);
-});
-audio.addEventListener('volumechange', () => { updateVolumeUI(); });
+  const scored = [];
+  for (const t of pool) {
+    if (exclude.has(t.id) || t.id === base.id) continue;
+    if (t.lastPlayed && now - t.lastPlayed < 2 * 3600e3) continue; // nicht gerade erst gehört
+    let s = 0;
+    for (const a of artistKeys(t)) if (mine.has(a)) s += 3;
+    if (albumKeyOf(t) === albumKeyOf(base)) s += 1;
+    if (t.genre && base.genre && t.genre.split(',')[0] === base.genre.split(',')[0]) s += 1.5;
+    if (t.fav) s += 1.5;
+    s += Math.random() * 1.5;
+    if (s > 1.6) scored.push([s, t.id]);
+  }
+  scored.sort((a, b) => b[0] - a[0]);
+  const top = scored.slice(0, 8);
+  return top.length ? top[Math.floor(Math.random() * top.length)][1] : null;
+}
+// Hält die nächsten Songs gefüllt: nach je drei Songs eine Empfehlung
+const recAdded = new Set(); // Empfehlungen, die neu dazukamen (nicht nur nach vorne geholt)
+function topUpSmart() {
+  if (!S.smart || !S.queue.length) return;
+  const WINDOW = 14;
+  // Gesperrt: schon gehört und die nächsten Plätze. Songs weiter hinten dürfen nach vorne geholt werden.
+  const near = new Set(S.queue.slice(0, Math.min(S.queue.length, S.index + WINDOW + 1)));
+  let run = 0;
+  let changed = false;
+  for (let i = S.index + 1; i < Math.min(S.queue.length, S.index + WINDOW); i++) {
+    if (S.recs.has(S.queue[i])) { run = 0; continue; }
+    run++;
+    if (run === 3) {
+      const rec = recommendFor(getT(S.queue[i]) || getT(curId), near);
+      if (!rec) break;
+      const later = S.queue.indexOf(rec, i + 1);
+      if (later > -1) S.queue.splice(later, 1); else recAdded.add(rec);
+      S.queue.splice(i + 1, 0, rec);
+      S.recs.add(rec);
+      near.add(rec);
+      changed = true;
+      run = 0;
+      i++;
+    }
+  }
+  if (changed) { saveState(); if (overlays.includes('queue')) renderQueue(); }
+}
+function removeRecsAhead() {
+  // Neu hinzugefügte Empfehlungen wieder raus, nach vorne geholte Songs bleiben einfach drin
+  S.queue = S.queue.filter((id, i) => i <= S.index || !recAdded.has(id));
+  S.recs = new Set([...S.recs].filter((id) => S.queue.indexOf(id) <= S.index));
+  recAdded.clear();
+}
 
 // ---- Media Session (Sperrbildschirm, Kopfhörertasten) ----
 function setupMediaSession() {
@@ -797,7 +1122,14 @@ function updateProgress() {
   npEls.bar.forEach((e) => { e.style.width = p * 100 + '%'; });
 }
 function updateModeButtons() {
-  npEls.shuffle.forEach((e) => e.classList.toggle('on', S.shuffle));
+  npEls.shuffle.forEach((e) => {
+    e.classList.toggle('on', S.shuffle);
+    e.classList.toggle('smart', S.smart);
+    e.innerHTML = icon(S.smart ? 'shuffle-smart' : 'shuffle');
+    const label = S.smart ? 'Smart Shuffle an (tippen: aus)' : S.shuffle ? 'Zufall an (tippen: Smart Shuffle)' : 'Zufallswiedergabe (S)';
+    e.title = label;
+    e.setAttribute('aria-label', label);
+  });
   npEls.repeat.forEach((e) => { e.classList.toggle('on', S.repeat !== 'off'); e.innerHTML = icon(S.repeat === 'one' ? 'repeat1' : 'repeat'); });
 }
 function updateVolumeUI() {
@@ -1006,7 +1338,7 @@ function renderQueue() {
 function qRow(t, qi, current = false) {
   return `<div class="row q-row ${current ? 'playing current' : ''}" data-qi="${qi}" data-id="${t.id}">
     ${coverHTML(t.coverId, t.album + t.artist, `row-cover ${t.live ? 'station-art' : ''}`, t.live ? 'radio' : 'music')}
-    <div class="row-main"><div class="row-title">${eqHTML()}<span class="t">${esc(t.title)}</span></div><div class="row-sub">${esc(t.artist)}</div></div>
+    <div class="row-main"><div class="row-title">${eqHTML()}<span class="t">${esc(t.title)}</span></div><div class="row-sub">${S.recs.has(t.id) ? `<span class="rec-tag">${icon('sparkle')}Empfohlen</span> · ` : ''}${esc(t.artist)}</div></div>
     ${current ? '<span></span>' : `<button class="icon-btn row-more" data-action="q-remove" aria-label="Entfernen">${icon('x')}</button>`}
   </div>`;
 }
@@ -1508,7 +1840,7 @@ function trackMenu(id, anchor, ctx = {}) {
     }
   }
   items.push({ sep: true }, { label: t.lyrics ? 'Songtext bearbeiten' : 'Songtext hinzufügen', icon: 'lyrics', fn: () => editLyrics(id) });
-  if (ctx.np) items.push({ label: 'Farbe & Live-Cover', icon: 'palette', fn: () => colorMenu(anchor) });
+  if (ctx.np) items.push({ label: 'Farbe & Live-Cover', icon: 'palette', fn: () => colorMenu(anchor) }, { label: eq.on ? 'Equalizer (an)' : 'Equalizer', icon: 'equalizer', fn: () => eqDialog() });
   if (!isOnline(t)) items.push({ label: 'Infos bearbeiten', icon: 'edit', fn: () => editTrack(id) });
   if (S.tracks.has(id)) {
     if (isOnline(t)) items.push({ sep: true });
@@ -2129,6 +2461,7 @@ views.settings = () => {
         <kbd>L</kbd><span>Aktuellen Titel als Favorit</span>
         <kbd>Q</kbd><span>Warteschlange</span>
         <kbd>T</kbd><span>Songtext ein/aus</span>
+        <kbd>E</kbd><span>Equalizer</span>
         <kbd>Strg + K</kbd><span>Suchen</span>
       </div>
     </div>` : ''}
@@ -2529,6 +2862,7 @@ const actions = {
   'import-folder': () => { $('#folder-input').value = ''; $('#folder-input').click(); },
   'reload-server-lib': () => loadServerLibrary(true),
   'phone-connect': () => phoneConnect(),
+  eq: () => eqDialog(),
   pack: (el) => packFor(el.dataset.list),
   toggle: () => togglePlay(),
   next: () => next(),
@@ -2858,6 +3192,7 @@ function setupEvents() {
     else if (k === 'r' || k === 'R') cycleRepeat();
     else if (k === 'l' || k === 'L') actions['fav-current']();
     else if (k === 'q' || k === 'Q') actions.queue();
+    else if (k === 'e' || k === 'E') eqDialog();
     else if (k === 't' || k === 'T') { if (overlays.includes('np')) setLyricsMode(!lyricsOpen); else actions['open-lyrics'](); }
     else if (k === '/') go('search');
     else handled = false;
@@ -3105,6 +3440,7 @@ async function init() {
   applyAccent(ls.get('klang-accent', 'Gold'));
   cacheNpEls();
   applyLiveCover();
+  updateEqButtons();
   updateVolumeUI();
   updateModeButtons();
   updatePlayState();

@@ -85,6 +85,7 @@
         </div>
       </div>
       <div class="pb-right d-only">
+        <button class="icon-btn" data-action="eq" title="Equalizer (E)" aria-label="Equalizer"><i data-icon="equalizer"></i></button>
         <button class="icon-btn" data-action="open-lyrics" title="Songtext (T)"><i data-icon="lyrics"></i></button>
         <button class="icon-btn" data-action="sleep" data-np="sleep" title="Sleep-Timer"><i data-icon="moon"></i></button>
         <button class="icon-btn" data-action="queue" data-np="queue-btn" title="Warteschlange (Q)"><i data-icon="queue"></i></button>
@@ -110,7 +111,10 @@
       <header class="np-head">
         <button class="icon-btn lg" data-action="close-np" aria-label="Schließen"><i data-icon="chevron-down"></i></button>
         <div class="np-src"><small>Wiedergabe aus</small><span data-np="source">Bibliothek</span></div>
-        <button class="icon-btn lg" data-action="np-menu" aria-label="Mehr"><i data-icon="more"></i></button>
+        <span class="np-head-r">
+          <button class="icon-btn lg" data-action="eq" aria-label="Equalizer"><i data-icon="equalizer"></i></button>
+          <button class="icon-btn lg" data-action="np-menu" aria-label="Mehr"><i data-icon="more"></i></button>
+        </span>
       </header>
       <div class="np-art"><div class="cover" data-np="cover"></div></div>
       <div class="np-lyrics" id="np-lyrics" aria-live="off"></div>
