@@ -841,6 +841,7 @@ async function loadAndPlay(autoplay = true, startAt = 0) {
     const seek = () => { el.currentTime = Math.min(startAt, (el.duration || startAt + 1) - 0.5); };
     if (el.readyState >= 1) seek(); else el.addEventListener('loadedmetadata', seek, { once: true });
   } else if (el.currentTime > 0) el.currentTime = 0;
+  extPause = false;
   if (autoplay) {
     if (isEqEl(el)) eq.ctx?.resume();
     el.play().catch((e) => { if (e.name === 'NotAllowedError') updatePlayState(); });
@@ -857,7 +858,41 @@ function togglePlay() {
   }
   if (!curId) { loadAndPlay(true, 0); return; }
   if (deferred) { const d = deferred; deferred = null; loadAndPlay(true, d.startAt); return; }
-  if (audio.paused) { wantPlay = true; if (isEqEl(audio)) eq.ctx?.resume(); audio.play().catch(() => {}); } else audio.pause();
+  if (audio.paused) resumePlay(); else audio.pause();
+}
+
+// iPhone: Nach Pause über AirPods, Sperrbildschirm oder Anruf läuft der Abspieler beim Weiterspielen
+// manchmal stumm weiter (iOS gibt den Ton nicht zurück). Dann den Song an derselben Stelle neu ansetzen.
+const IOS = /iphone|ipad|ipod/i.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+let extPause = false; // von außen pausiert (Kopfhörer, Sperrbildschirm, Unterbrechung)
+function hardResume(el) {
+  const pos = el.currentTime || 0;
+  if (!el.getAttribute('src')) return el.play();
+  lastPos = null;
+  el.load();
+  if (pos > 0) {
+    const seek = () => { try { el.currentTime = pos; } catch { /* */ } };
+    if (el.readyState >= 1) seek(); else el.addEventListener('loadedmetadata', seek, { once: true });
+  }
+  return el.play();
+}
+function resumePlay() {
+  if (deferred) { togglePlay(); return; }
+  wantPlay = true;
+  const ext = extPause;
+  extPause = false;
+  if (isEqEl(audio) && eq.ctx) {
+    if (IOS && ext && eq.ctx.state !== 'running') {
+      // Equalizer-Ton (Web Audio) kommt auf dem iPhone nach einer Unterbrechung nicht zurück: normal weiterspielen
+      eq.on = false; saveEq(); updateEqButtons();
+      reloadOnly = true;
+      loadAndPlay(true, audio.currentTime || 0);
+      toast('Equalizer aus, damit der Ton über Kopfhörer weiterläuft.', 3500);
+      return;
+    }
+    eq.ctx.resume().catch(() => {});
+  }
+  (IOS && ext ? hardResume(audio) : audio.play()).catch(() => {});
 }
 
 function next(auto = false) {
@@ -1036,7 +1071,7 @@ document.addEventListener('visibilitychange', () => { if (document.hidden) saveS
 function bindAudio(el) {
   const on = (type, fn) => el.addEventListener(type, (e) => { if (el === audio) fn(e); });
   on('play', () => { updatePlayState(); sendPresence(); updatePosState(); });
-  on('pause', () => { updatePlayState(); saveState(); sendPresence(); updatePosState(); });
+  on('pause', () => { if (document.hidden && !audio.ended) extPause = true; updatePlayState(); saveState(); sendPresence(); updatePosState(); });
   on('durationchange', updatePosState);
   on('playing', () => { errorStreak = 0; lastPos = audio.currentTime; });
   on('seeking', () => { lastPos = null; });
@@ -1406,9 +1441,9 @@ function removeRecsAhead() {
 function setupMediaSession() {
   if (!('mediaSession' in navigator)) return;
   const h = (a, f) => { try { navigator.mediaSession.setActionHandler(a, f); } catch { /* nicht unterstützt */ } };
-  h('play', () => { if (deferred) { togglePlay(); return; } wantPlay = true; audio.play().catch(() => {}); });
-  h('pause', () => audio.pause());
-  h('stop', () => audio.pause());
+  h('play', () => { if (!curId || !audio.paused) { if (!curId) togglePlay(); return; } resumePlay(); });
+  h('pause', () => { extPause = true; audio.pause(); });
+  h('stop', () => { extPause = true; audio.pause(); });
   h('previoustrack', prev);
   h('nexttrack', () => next());
   h('seekto', (d) => { if (d.fastSeek && 'fastSeek' in audio) audio.fastSeek(d.seekTime); else audio.currentTime = d.seekTime; updatePosState(); });
